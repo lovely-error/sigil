@@ -1044,7 +1044,7 @@ fn one_shild_one_parent() {
 
 #[test]
 fn child_child_check_dead() {
-  const Limit:usize = 17;
+  const Limit:usize = 10000;
   struct ParentData { counter: AtomicU64, str: String, iter: u64 }
   fn parent(ctx: &TaskContext) -> Continuation {
     let frame = unsafe { &mut *ctx.access_frame::<ParentData>() };

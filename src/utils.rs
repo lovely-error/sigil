@@ -41,6 +41,14 @@ pub fn ptr_align_dist<T>(ptr: *const T, align: usize) -> u64 {
   return result - ptrint;
 }
 
+pub fn num_align_dist(addr: u64, align: usize) -> u64 {
+  let order = high_order_pow2(align as u64);
+  let mul = addr >> order;
+  let mut result = mul << order;
+  if (result as u64) < addr { result += align as u64 };
+  return result - addr;
+}
+
 #[test]
 fn test_align_works() {
   let ptr = (8 * 7) as *mut u8;
