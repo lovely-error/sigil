@@ -1,6 +1,6 @@
-use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping, addr_of}, mem::{size_of, transmute, MaybeUninit, forget}, cell::UnsafeCell};
+use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping, addr_of, addr_of_mut}, mem::{size_of, MaybeUninit, forget}, cell::UnsafeCell};
 
-use crate::{root_alloc::{RootAllocator, Block4KPtr}, cast};
+use crate::{root_alloc::{RootAllocator, Block4KPtr}, cast, utils::DrainablePageHolder};
 
 
 // this datatype is monomorphisation-aware.
@@ -21,7 +21,7 @@ pub struct Array<T>(
   PhantomData<T>);
 
 impl <T> Array<T> {
-  pub fn new(ralloc: *mut RootAllocator) -> Self {
+  pub fn new(ralloc: *mut dyn DrainablePageHolder) -> Self {
     Self(UnsafeCell::new(ArrayInternals::new(ralloc)), PhantomData)
   }
   pub fn ref_item_at_index(&self, index: usize) -> Option<&mut T> {
@@ -56,27 +56,27 @@ impl <T> Array<T> {
   pub fn reset(&self) {
     let this = self.project_internals();
     this.access_head = this.head_page;
-    this.adjust_access_head(size_of::<T>());
+    this.put_access_head_to_first_element(size_of::<T>());
     this.item_count = 0;
   }
 }
 
 struct ArrayInternals {
-  root_allocator: *mut RootAllocator,
+  mem_block_provider: *mut dyn DrainablePageHolder,
   head_page: *mut u8,
   tail_page: *mut u8,
   access_head: *mut u8,
   item_count: usize,
 }
 impl ArrayInternals {
-  fn new(ralloc: *mut RootAllocator) -> Self {
-    Self { root_allocator: ralloc,
+  fn new(page_provider: *mut dyn DrainablePageHolder) -> Self {
+    Self { mem_block_provider: page_provider,
            head_page: null_mut(),
            tail_page: null_mut(),
            access_head: null_mut(),
            item_count: 0,}
   }
-  fn adjust_access_head(&mut self, item_size: usize) { unsafe {
+  fn put_access_head_to_first_element(&mut self, item_size: usize) { unsafe {
     let off = self.slots_occupied_by_mtd(item_size);
     self.access_head = self.access_head.add(off * item_size) ;
   } }
@@ -84,7 +84,7 @@ impl ArrayInternals {
     assert!(self.head_page == null_mut());
     let page;
     loop {
-      if let Some(v) = (*self.root_allocator).try_get_block() {
+      if let Some(v) = (*self.mem_block_provider).try_drain_page() {
         page = v; break
       };
     }
@@ -94,12 +94,12 @@ impl ArrayInternals {
     let mtd = &mut *ptr.cast::<PageMetadata>();
     *mtd = PageMetadata {next_page:null_mut(), previous_page:null_mut()};
     self.access_head = ptr;
-    self.adjust_access_head(item_size);
+    self.put_access_head_to_first_element(item_size);
   } }
   fn expand_storage(&mut self, item_size: usize) { unsafe {
     let page;
     loop {
-      if let Some(v) = (*self.root_allocator).try_get_block() {
+      if let Some(v) = (*self.mem_block_provider).try_drain_page() {
         page = v; break
       };
     }
@@ -109,7 +109,7 @@ impl ArrayInternals {
     (&mut *self.tail_page.cast::<PageMetadata>()).next_page = ptr;
     self.tail_page = ptr;
     self.access_head = ptr;
-    self.adjust_access_head(item_size);
+    self.put_access_head_to_first_element(item_size);
   } }
   fn slots_occupied_by_mtd(&self, item_size: usize) -> usize {
     let mut off = size_of::<PageMetadata>() / item_size;
@@ -165,7 +165,7 @@ fn Array_push_impl(
   copy_nonoverlapping(new_item_source_loc, object.access_head, item_size);
   object.access_head = object.access_head.add(item_size);
   let at_the_edge =
-    (object.access_head as u64 >> 12) << 12 == object.access_head as u64;
+    (object.access_head as u64 & !((1 << 12) - 1)) == object.access_head as u64;
   if at_the_edge {
     let head = object.access_head.sub(4096);
     let mtd = &*head.cast::<PageMetadata>();
@@ -173,7 +173,7 @@ fn Array_push_impl(
     let has_next = next_page != null_mut();
     if has_next {
       object.access_head = next_page;
-      object.adjust_access_head(item_size);
+      object.put_access_head_to_first_element(item_size);
     } else {
       object.expand_storage(item_size)
     }
@@ -191,7 +191,7 @@ fn Array_pop_impl(
   assert!(object.item_count != 0);
   let adjusted_mtd_offset = item_size as u64 * mtd_slot_count;
   let offset_head = object.access_head as u64 - adjusted_mtd_offset;
-  let at_the_edge = (offset_head >> 12) << 12 == offset_head;
+  let at_the_edge = (offset_head & !((1 << 12) - 1)) == offset_head;
   if at_the_edge {
     let mtd = &*(offset_head as *mut ()).cast::<PageMetadata>();
     let pp = mtd.previous_page;
@@ -284,4 +284,61 @@ fn indexing_works() {
       assert!(*n == i as u32);
     } else { panic!() };
   }
+}
+
+impl <T> DrainablePageHolder for Array<T> {
+  fn try_drain_page(&mut self) -> Option<Block4KPtr> { unsafe {
+    let ArrayInternals { access_head, tail_page, .. } = &mut *self.0.get();
+    let page_start_addr = (*access_head as usize) & !((1 << 12) - 1);
+    let head_on_last_page = page_start_addr == *tail_page as _;
+    if head_on_last_page { return None } // nothing to give away
+
+    let last_page = *tail_page;
+    let last_mtd = &*last_page.cast::<PageMetadata>();
+    let page_before_last = last_mtd.previous_page;
+    let only_one_page = page_before_last == null_mut();
+    if only_one_page { return None } // dont rob the thing of last possesions
+
+    let pre_last_mtd = &mut*page_before_last.cast::<PageMetadata>();
+    pre_last_mtd.next_page = null_mut();
+    *tail_page = page_before_last;
+
+    return Some(Block4KPtr(last_page))
+  }; }
+}
+
+#[test]
+fn draining_works() { unsafe {
+  let mut ralloc = RootAllocator::new();
+  let mut arr = Array::<u64>::new(addr_of_mut!(ralloc));
+  for i in 0 .. 512 {
+    arr.push(i);
+  }
+  for _ in 0 .. 512 {
+    let _ = arr.pop();
+  }
+  let Block4KPtr(ptr) = arr.try_drain_page().unwrap();
+  ptr.write_bytes(u8::MAX, 4096);
+  for i in 0 .. 512 {
+    arr.push(i)
+  }
+  for i in 0 .. 512 {
+    let item = arr.pop().unwrap();
+    assert!(511 - i == item)
+  }
+  for i in 0 .. 4096 {
+    assert!(*ptr.add(i) == u8::MAX)
+  }
+} }
+
+#[test]
+fn draining_on_empty() {
+  let mut ralloc = RootAllocator::new();
+  let mut arr = Array::<u64>::new(addr_of_mut!(ralloc));
+
+  let smth = arr.try_drain_page();
+  if let Some(_) = smth { panic!() }
+
+  arr.push(1);
+  if let Some(_) = arr.try_drain_page(){ panic!()};
 }

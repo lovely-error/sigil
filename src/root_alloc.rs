@@ -1,7 +1,7 @@
 
 use std::{alloc::{alloc, Layout}, sync::atomic::{AtomicU16, Ordering, fence}, cell::UnsafeCell, thread, ptr::{null_mut, addr_of_mut, addr_of, slice_from_raw_parts}, mem::MaybeUninit};
 
-use crate::cast;
+use crate::{cast, utils::DrainablePageHolder};
 
 pub struct RootAllocator {
   super_page_start: UnsafeCell<*mut [u8;4096]>,
@@ -10,7 +10,7 @@ pub struct RootAllocator {
 
 impl RootAllocator {
   fn alloc_superpage() -> *mut () {
-    let mem = unsafe { alloc(Layout::from_size_align_unchecked(1 << 21, 1 << 21)) };
+    let mem = unsafe { alloc(Layout::from_size_align_unchecked(1 << 21, 4096)) };
     mem.cast()
   }
   pub fn new() -> Self {
@@ -39,6 +39,12 @@ impl RootAllocator {
     fence(Ordering::Acquire); // we must see that page got allocated
     let ptr = unsafe {(*self.super_page_start.get()).add(index as usize)};
     return Some(Block4KPtr(ptr.cast()));
+  }
+  pub fn get_block(&self) -> Block4KPtr {
+    loop {
+      let maybe_page = self.try_get_block();
+      if let Some(page) = maybe_page { return page }
+    }
   }
 }
 pub struct Block4KPtr(pub(crate) *mut u8);
@@ -76,7 +82,13 @@ fn alloc_works() {
     let ptr = ptrs[i];
     let sl = unsafe { &*slice_from_raw_parts(ptr, 4096) };
     for s in sl {
-        assert!(*s == i as u8);
+        assert!(*s == i as u8, "threads got same memory region");
     }
+  }
+}
+
+impl DrainablePageHolder for RootAllocator {
+  fn try_drain_page(&mut self) -> Option<Block4KPtr> {
+    self.try_get_block()
   }
 }

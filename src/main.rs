@@ -1,3 +1,7 @@
+#![feature(portable_simd)]
+#![feature(exact_size_is_empty)]
+#![feature(absolute_path)]
+
 mod root_alloc;
 mod utils;
 mod loopbuffer;
@@ -5,8 +9,20 @@ mod driver;
 mod array;
 mod stable_map;
 
-fn main() {
-    use core::mem::transmute;
+mod semi_inline_seqv;
 
-    println!("{:#064b}", main as u64);
+mod loomed_q;
+
+mod coordinated_killing;
+
+mod mpsc;
+
+mod parser;
+
+mod cli;
+
+mod interlacing_alloc;
+
+fn main() {
+  cli::main()
 }

@@ -1,121 +1,134 @@
 
-use std::{sync::atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, compiler_fence}, mem::{size_of, MaybeUninit, forget, ManuallyDrop, transmute, align_of}, ptr::{addr_of, null_mut, copy_nonoverlapping, addr_of_mut}, thread::{JoinHandle, self, park, yield_now, Thread, current}, cell::UnsafeCell, str::FromStr, cmp::min, alloc::{alloc, Layout}};
+use std::{sync::atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, compiler_fence}, mem::{size_of, MaybeUninit, forget, ManuallyDrop, transmute, align_of, transmute_copy, needs_drop}, ptr::{addr_of, null_mut, copy_nonoverlapping, addr_of_mut, drop_in_place}, thread::{JoinHandle, self, park, yield_now, Thread, current, sleep}, cell::UnsafeCell, str::FromStr, cmp::min, alloc::{alloc, Layout}, marker::PhantomData, ops::Add, time::{Duration, SystemTime}, iter::zip, collections::HashMap};
 
-use crate::{root_alloc::{RootAllocator, Block4KPtr}, utils::{ptr_align_dist, with_scoped_consume, bitwise_copy, high_order_pow2}, cast, loopbuffer::InlineLoopBuffer, array::Array, garbage,  };
+use crate::{root_alloc::{RootAllocator, Block4KPtr}, utils::{ptr_align_dist, with_scoped_consume, bitcopy, high_order_pow2, DrainablePageHolder, offset_to_higher_multiple, bitcast}, cast, loopbuffer::{InlineLoopBuffer, LoopBufferTraverser}, array::Array, garbage, semi_inline_seqv::SemiInlineSeqv, mpsc::MPSCQueue,  };
+
+extern crate core_affinity;
 
 pub struct SubRegionAllocator {
-  ralloc: *mut RootAllocator,
+  page_provider: *mut dyn DrainablePageHolder,
   current_page_start: *mut u8,
-  offset: *mut u8,
+  allocation_tail: *mut u8,
   free_list: *mut u8
 }
 
-static mut acquire_count : AtomicU64 = AtomicU64::new(0);
-static mut release_count : AtomicU64 = AtomicU64::new(0);
+static mut DEALLOCATION_COUNT : AtomicU64 = AtomicU64::new(0);
+static mut ALLOCATION_COUNT : AtomicU64 = AtomicU64::new(0);
 
 impl SubRegionAllocator {
   pub fn new(
-    root_alloc_ref: *mut RootAllocator
-  ) -> Self { unsafe {
-    let mut raw = MaybeUninit::<Self>::uninit();
-    let mref = raw.assume_init_mut();
-    mref.ralloc = root_alloc_ref;
-    mref.free_list = null_mut();
-    let mut init = raw.assume_init();
-    init.replace_page();
-    return init;
-  }; }
-  fn replace_page(&mut self) { unsafe {
-    let has_free_pages = self.free_list != null_mut();
-    let ptr;
-    if has_free_pages {
-      let next_page = *self.free_list.cast::<*mut u8>();
-      ptr = self.free_list;
-      self.free_list = next_page;
-    } else {
-      let page;
-      loop {
-        if let Some(block) = (*self.ralloc).try_get_block() {
-          page = block; break;
-        }
+    page_provider: *mut dyn DrainablePageHolder
+  ) -> Self {
+    let mut raw = garbage!(Self);
+    raw.page_provider = page_provider;
+    raw.free_list = null_mut();
+    raw.current_page_start = null_mut();
+    return raw;
+  }
+  pub(crate) fn give_page_for_recycle(&mut self, Block4KPtr(ptr):Block4KPtr) { unsafe {
+    *ptr.cast::<*mut u8>() = self.free_list;
+    self.free_list = ptr;
+  } }
+  fn try_take_spare_page(&mut self) -> Option<Block4KPtr> { unsafe {
+    if self.free_list == null_mut() { return None }
+    let current = self.free_list;
+    let next = *self.free_list.cast::<*mut u8>();
+    self.free_list = next;
+    return Some(Block4KPtr(current))
+  } }
+  fn set_new_page(&mut self) { unsafe {
+    let new_page_ptr;
+    let maybe_page = self.drain_spare_page();
+    match maybe_page {
+      Some(Block4KPtr(ptr)) => new_page_ptr = ptr,
+      None => {
+        let Block4KPtr(ptr) = (*self.page_provider).try_drain_page().unwrap_or_else(||{
+          panic!("infailable page provider failed to give page")
+        });
+        new_page_ptr = ptr
       }
-      let Block4KPtr(ptr_) = page;
-      ptr = ptr_;
     }
-    self.current_page_start = ptr;
+    self.current_page_start = new_page_ptr;
     {
-      let ptr = &mut *ptr.cast::<RegionMetadata>();
+      let ptr = &mut *new_page_ptr.cast::<RegionMetadata>();
       ptr.ref_count = AtomicU16::new(0);
     };
-    self.offset = ptr.add(size_of::<RegionMetadata>());
+    self.allocation_tail = new_page_ptr.add(size_of::<RegionMetadata>());
   } }
   #[track_caller]
-  pub fn srallocate(
+  pub fn sralloc(
     &mut self,
     byte_size: usize,
     alignment: usize
   ) -> SubRegionRef { unsafe {
+    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    assert!(byte_size != 0);
+    let mut reserved_space = size_of::<RegionMetadata>();
+    reserved_space += offset_to_higher_multiple(reserved_space as u64, alignment) as usize;
     assert!(
-      byte_size <= 4096 - size_of::<RegionMetadata>(),
-      "too big allocation, ill fix it when need be");
+      byte_size <= 4096 - reserved_space,
+      "too big allocation, ill fix it when need come");
+    if self.current_page_start.is_null() {
+      self.set_new_page()
+    }
     loop {
-      let mut ptr = self.offset;
+      let mut ptr = self.allocation_tail;
       let off = ptr_align_dist(ptr, alignment);
       ptr = ptr.add(off as usize);
-      let aligned_ptr = ptr;
-      ptr = ptr.add(byte_size);
-      if ptr as u64 >= (self.current_page_start as u64 + 4096) {
-        self.replace_page(); continue;
+      let next_allocation_tail = ptr.add(byte_size);
+      if next_allocation_tail as u64 >= (self.current_page_start as u64 + 4096) {
+        self.set_new_page(); continue;
       }
-      let _ = (&mut*self.current_page_start.cast::<RegionMetadata>())
-        .ref_count.fetch_add(1, Ordering::Release);
-      acquire_count.fetch_add(1, Ordering::Relaxed);
-      self.offset = ptr;
-      let dist = aligned_ptr as u64 - self.current_page_start as u64;
+      let _ = (*self.current_page_start.cast::<RegionMetadata>())
+        .ref_count.fetch_add(1, Ordering::AcqRel);
+
+      self.allocation_tail = next_allocation_tail;
+      let dist = ptr as u64 - self.current_page_start as u64;
       assert!(dist <= u16::MAX as u64);
+
       return SubRegionRef::new(self.current_page_start, dist as u16);
     }
   }; }
   #[track_caller]
   pub fn dispose(&mut self, ptr: SubRegionRef) { unsafe {
+    DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+
     let (root,_) = ptr.get_components();
-    let i = (&*root.cast::<RegionMetadata>()).ref_count.fetch_sub(1, Ordering::Relaxed);
-    release_count.fetch_add(1, Ordering::Relaxed);
-    if i - 1 == 0 {
-      // println!("page freed!");
-      fence(Ordering::Acquire);
+    let i = (&*root.cast::<RegionMetadata>()).ref_count.fetch_sub(1, Ordering::AcqRel);
+    if i == 1 {
       // this page is ours!
-      *root.cast::<*mut u8>() = self.free_list;
-      self.free_list = root.cast();
+      self.give_page_for_recycle(Block4KPtr(root.cast()));
     }
     // forget(ptr);
   } }
-  #[inline(never)]
-  pub fn srallocate_frame(
-    &mut self,
-    env_size: usize,
-    env_align:usize,
-    mtd_size: usize
-  ) -> (SubRegionRef, *mut u8, *mut u8) { unsafe {
-    let frame_alignment = env_align;
-    let frame_size = env_size;
-    let (real_frame_size, offset_order) =
-      adjusted_frame_size(frame_size, frame_alignment, mtd_size);
-    let data_frame_offset = renorm_offset_order(offset_order);
-    // maybe remove this restriction
-    let frame_allocation_limit = 4096 - size_of::<RegionMetadata>();
-    if real_frame_size >= frame_allocation_limit {
-      panic!("FIXME:Cant allocate this much for a task frame.")
-    }
-    let frame_ref = self.srallocate(real_frame_size, align_of::<ParentedTaskMetadata>());
-    let frame_ptr = frame_ref.deref();
-    let data = frame_ptr.add(data_frame_offset);
-    return (frame_ref, frame_ptr, data)
-  }; }
+  fn drain_spare_page(&mut self) -> Option<Block4KPtr> { unsafe {
+    if self.free_list == null_mut() { return None }
+    let page = self.free_list;
+    let page_after_current = *self.free_list.cast::<*mut u8>();
+    self.free_list = page_after_current;
+    return Some(Block4KPtr(page))
+  } }
+}
+
+impl DrainablePageHolder for SubRegionAllocator {
+  fn try_drain_page(&mut self) -> Option<Block4KPtr> {
+      if let k@Some(_) = self.drain_spare_page() {
+        return k
+      } else {
+        unsafe { (&mut *self.page_provider).try_drain_page() }
+      }
+  }
 }
 
 pub struct SubRegionRef(u64);
 impl SubRegionRef {
+  pub fn new_null() -> Self {
+    SubRegionRef(0)
+  }
+  pub fn is_null(&self) -> bool {
+    self.0 == 0
+  }
   pub fn new(
     region_start_addr: *mut u8,
     byte_offset: u16,
@@ -155,12 +168,12 @@ fn test_acks_work() { unsafe {
   let mut boxes: [MaybeUninit<SubRegionRef>; 64] = MaybeUninit::uninit().assume_init();
   let boxess = boxes.as_mut_ptr().cast::<SubRegionRef>();
   for i in 0 ..64-1 {
-    let v = sralloc.srallocate(16, 64);
+    let v = sralloc.sralloc(16, 64);
     let ptr = v.deref();
     *ptr.cast() = u16::MAX;
     boxess.add(i).write(v);
   }
-  let above = sralloc.srallocate(16, 64); // must cause page replace
+  let above = sralloc.sralloc(16, 64); // must cause page replace
   above.deref().cast::<u16>().write(u16::MAX);
   boxess.add(63).write(above);
   for i in 0 .. 64 {
@@ -178,80 +191,75 @@ struct WorkerSetData {
   inline_free_indicies: AtomicU64,
   outline_free_indicies: Option<Array<AtomicU64>>,
   total_worker_count: u32,
-  liveness_count: AtomicU32,
 }
 
 impl WorkerSet {
   fn inline_free_indicies(&self) -> &AtomicU64 {
     &unsafe { &*self.0.get() }.inline_free_indicies
   }
-  fn liveness_count(&self) -> &AtomicU32 {
-    &unsafe { &*self.0.get() }.liveness_count
-  }
   fn total_worker_count(&self) -> u32 {
     unsafe { &*self.0.get() }.total_worker_count
   }
-  fn mref_worker_at_index(&self, index: u32) -> Option<&mut Worker> { unsafe {
+  fn mref_worker_at_index(&self, index: u32) -> &mut Worker { unsafe {
     let this = &mut *self.0.get();
     let work_count = this.total_worker_count;
-    if index >= work_count { return None }
+    if index >= work_count { panic!("invalid worker index") }
     if index < work_count {
       let ptr = addr_of_mut!(this.inline_workers).cast::<Worker>();
       let worker = &mut *ptr.add(index as usize );
-      return Some(worker)
+      return worker
     } else {
       if let Some(w) = &this.outline_workers {
         let worker = w.ref_item_at_index(index as usize - 16).unwrap();
-        return Some(worker);
+        return worker;
       };
       panic!()
     };
   }; }
-  fn set_as_free(&self, index: u32) -> Option<bool> {
+  fn set_as_free(&self, index: u32) {
     let this = unsafe { &mut *self.0.get() };
-    if index >= this.total_worker_count { return None }
+    if index >= this.total_worker_count { panic!("invalid worker index") }
 
     let index_mask = 1u64 << index;
     let mask = !index_mask ;
-    let old = this.inline_free_indicies.fetch_and(mask, Ordering::Relaxed);
-    let already_taken = old & index_mask != 0;
-    return Some(already_taken)
+    // we must see changes to indicies as immidiate thus acqrel
+    let _ = this.inline_free_indicies.fetch_and(mask, Ordering::SeqCst);
   }
   // true, if already occupied
-  fn set_as_occupied(&self, index: u32) -> Option<bool> {
+  fn set_as_occupied(&self, index: u32) -> bool {
     let this = unsafe { &mut *self.0.get() };
-    if index >= this.total_worker_count { return None }
+    if index >= this.total_worker_count { panic!("invalid index of worker") }
 
     let mask = 1u64 << index;
-    let old = this.inline_free_indicies.fetch_or(mask, Ordering::Relaxed);
+    // we mut see changes to indicies as immidiate or
+    // some two wokers might end up aquiring third one and
+    // that would be pretty bad
+    let old = this.inline_free_indicies.fetch_or(mask, Ordering::SeqCst);
     let already_taken = old & mask != 0;
-    return Some(already_taken)
+    return already_taken
   }
-  fn try_acquire_free_worker(&self) -> Option<&mut Worker> { unsafe {
+  fn try_acquire_free_worker_mref(&self) -> Option<&mut Worker> { unsafe {
     let this = &mut *self.0.get();
+    let relevance_mask = u64::MAX << this.total_worker_count;
+    let mut indicies = this.inline_free_indicies.load(Ordering::SeqCst);
     loop {
-      let indicies = this.inline_free_indicies.load(Ordering::Relaxed);
-      if indicies == u64::MAX {
+      if indicies | relevance_mask == u64::MAX {
+        // nothign to grab in inlines
         if let Some(_) = this.outline_workers {
           todo!()
         }
         return None ;
       };
       let some_index = indicies.trailing_ones();
-      if some_index >= this.total_worker_count { return None; }
-      let mask = 1u64 << some_index;
-      let prior = this.inline_free_indicies.fetch_or(mask, Ordering::Relaxed);
-      let did_acquire = prior & mask == 0;
+      let index_mask = 1u64 << some_index;
+      indicies = this.inline_free_indicies.fetch_or(index_mask, Ordering::SeqCst);
+      let did_acquire = indicies & index_mask == 0;
       if !did_acquire { continue; }
-      if some_index < 16 {
-        let ptr = this.inline_workers.as_ptr().add(some_index as usize);
-        let ptr = ptr.add(some_index as usize).cast::<Worker>() as *mut _;
-        let val = &mut *ptr;
-        return Some(val)
-      } else {
-        // somewhere outline
-        todo!()
-      }
+
+      let ptr = this.inline_workers.as_ptr().add(some_index as usize);
+      let ptr = ptr.cast::<Worker>() as *mut _;
+      let val = &mut *ptr;
+      return Some(val)
     }
   } }
 }
@@ -266,17 +274,17 @@ impl <const LocalCacheCapacity: usize> TaskSet<LocalCacheCapacity> {
     let outline = self.outline_tasks.item_count();
     return inline + outline;
   }
-  fn push(&mut self, new_item: Task) {
+  fn enque(&mut self, new_item: Task) {
     let clone = unsafe { addr_of!(new_item).read() };
-    let did_push = self.inline_tasks.push(new_item);
+    let did_push = self.inline_tasks.push_to_tail(new_item);
     if !(did_push) {
       self.outline_tasks.push(clone)
     } else {
       forget(clone)
     }
   }
-  fn pop(&mut self) -> Option<Task> {
-    let task = self.inline_tasks.pop();
+  fn deque(&mut self) -> Option<Task> {
+    let task = self.inline_tasks.pop_from_head();
     if let None = task {
       let task = self.outline_tasks.pop();
       return task;
@@ -289,15 +297,15 @@ impl <const LocalCacheCapacity: usize> TaskSet<LocalCacheCapacity> {
 struct WorkerFlags(AtomicU8);
 impl WorkerFlags {
   fn new() -> Self {
-    cast!(0u8, _)
+    Self(AtomicU8::new(0))
   }
-  const SELFKILL_BIT: u8 = 1;
-  fn mark_self_kill(&self) {
-    let _ = self.0.fetch_or(Self::SELFKILL_BIT, Ordering::Relaxed);
+  const TERMINATION_BIT: u8 = 1 << 0;
+  fn mark_for_termination(&self) {
+    let _ = self.0.fetch_or(Self::TERMINATION_BIT, Ordering::SeqCst);
   }
-  fn should_kill_self(&self) -> bool {
-    let flags = self.0.load(Ordering::Relaxed);
-    return flags & Self::SELFKILL_BIT != 0;
+  fn is_marked_for_termination(&self) -> bool {
+    let flags = self.0.load(Ordering::SeqCst);
+    return flags & Self::TERMINATION_BIT != 0;
   }
   const SUSPEND_BIT: u8 = 1 << 1;
   fn mark_for_suspend(&self) {
@@ -310,30 +318,30 @@ impl WorkerFlags {
     let flags = self.0.load(Ordering::Relaxed);
     return flags & Self::SUSPEND_BIT != 0
   }
-  const INITED_BIT: u8 = 1 << 2;
+  const CTX_INIT_BIT: u8 = 1 << 2;
   fn mark_as_initialised(&self) {
-    let _ = self.0.fetch_or(Self::INITED_BIT, Ordering::Relaxed);
+    let _ = self.0.fetch_or(Self::CTX_INIT_BIT, Ordering::Relaxed);
   }
   fn is_initialised(&self) -> bool {
     let flags = self.0.load(Ordering::Relaxed);
-    return flags & Self::INITED_BIT != 0
+    return flags & Self::CTX_INIT_BIT != 0
   }
-  const INITIATOR_BIT: u8 = 1 << 3;
-  fn mark_for_first_init(&self) {
-    let _ = self.0.fetch_or(Self::INITIATOR_BIT, Ordering::Relaxed);
+  const FIRST_INIT_BIT: u8 = 1 << 3;
+  fn mark_as_started(&self) {
+    let _ = self.0.fetch_or(Self::FIRST_INIT_BIT, Ordering::Relaxed);
   }
-  fn is_first_init(&self) -> bool {
+  fn was_started(&self) -> bool {
     let flags = self.0.load(Ordering::Relaxed);
-    return flags & Self::INITIATOR_BIT != 0;
+    return flags & Self::FIRST_INIT_BIT != 0;
   }
   const WORK_SUBMITED_BIT: u8 = 1 << 4;
-  fn mark_work_as_submited(&self) {
+  fn mark_first_work_as_submited(&self) {
     let _ = self.0.fetch_or(Self::WORK_SUBMITED_BIT, Ordering::Relaxed);
   }
   fn unmark_work_as_submited(&self) {
     let _ = self.0.fetch_and(!Self::WORK_SUBMITED_BIT, Ordering::Relaxed);
   }
-  fn is_work_submited(&self) -> bool {
+  fn is_first_work_submited(&self) -> bool {
     let flags = self.0.load(Ordering::Relaxed);
     return flags & Self::WORK_SUBMITED_BIT != 0
   }
@@ -342,7 +350,7 @@ impl WorkerFlags {
     let _ = self.0.fetch_or(Self::TRANSACTION_BEGAN_BIT, Ordering::Relaxed);
   }
   const TRANSACTION_ENDED_BIT:u8 = 1 << 6;
-  fn mark_transaction_end(&self) {
+  fn mark_transaction_ended(&self) {
     let _ = self.0.fetch_or(Self::TRANSACTION_ENDED_BIT, Ordering::Relaxed);
   }
   fn has_transaction_began(&self) -> bool {
@@ -362,51 +370,38 @@ impl WorkerFlags {
 struct Worker {
   runner_handle: Option<JoinHandle<()>>,
   work_group: *mut WorkGroup,
-  task_share_port: MaybeUninit<*mut TaskSet<TaskCacheSize>>,
-  srallocator_ref: MaybeUninit<*mut SubRegionAllocator>,
-
+  inner_context_ptr: MaybeUninit<*mut CommonWorkerInnerContext>,
   index: u32,
   flags: WorkerFlags,
+  core_id: core_affinity::CoreId
 }
 impl Worker {
-  // last active worker
-  fn mark_retire(&self) -> bool { unsafe {
-    let prior = (*self.work_group).worker_set.liveness_count().fetch_sub(1, Ordering::Relaxed);
-    return prior - 1 == 0
-  } }
-  fn unmark_retire(&self) { unsafe {
-    let _ = (*self.work_group).worker_set.liveness_count().fetch_add(1, Ordering::Relaxed);
-  } }
   // false if already occupied
   fn mark_as_occupied(&self) -> bool { unsafe {
-    (*self.work_group).worker_set.set_as_occupied(self.index).unwrap()
+    (*self.work_group).worker_set.set_as_occupied(self.index)
   } }
+  fn mark_as_free(&self) {
+    unsafe{(*self.work_group).worker_set.set_as_free(self.index)}
+  }
   fn wakeup(&self) {
     if let Some(thread) = &self.runner_handle {
       thread.thread().unpark();
     };
   }
   fn start(&mut self) { unsafe {
-    if self.flags.is_initialised() { return };
+    let init_bit = WorkerFlags::FIRST_INIT_BIT;
+    let prior = self.flags.0.fetch_or(init_bit, Ordering::AcqRel);
+    if prior & init_bit != 0 {
+      panic!("attempt to reinit worker")
+    }
     let _ = self.mark_as_occupied();
-    let this = {
-      let referee = transmute::<_, u64>(self);
-      move || transmute::<_, &mut Self>(referee)
-    };
-    if let None = this().runner_handle {
-      let copy = transmute::<_, u64>(this());
+    if let None = self.runner_handle {
+      let copy = transmute_copy::<_, u64>(&self);
       let thread = thread::spawn(move ||{
         let ptr = transmute::<_, &mut Worker>(copy);
-        task_execution_loop(ptr);
+        worker_processing_routine(ptr);
       });
-      this().runner_handle = Some(thread);
-      loop {
-        let inited = this().flags.is_initialised();
-        if inited {
-          fence(Ordering::Acquire);
-          break;
-        }
-      }
+      self.runner_handle = Some(thread);
     }
   } }
   fn terminate(&mut self) {
@@ -420,150 +415,316 @@ impl Worker {
       };
     });
   }
+  fn with_synced_access(&mut self, action: impl FnOnce(&mut Self)) {
+    let was_started = self.flags.was_started();
+    assert!(was_started, "cannot acccess context of a worker that was not started");
+    while !self.flags.is_initialised() {}
+    fence(Ordering::Acquire);
+    if self.flags.is_first_work_submited() {
+      self.flags.mark_transaction_begin();
+      action(self);
+      fence(Ordering::Release);
+      self.flags.mark_transaction_ended();
+      self.wakeup();
+    } else {
+      action(self);
+      fence(Ordering::Release);
+      self.flags.mark_first_work_as_submited()
+    }
+  }
 }
 
-const TaskCacheSize:usize = 16;
-fn task_execution_loop(worker: &mut Worker) { unsafe {
-  (*worker.work_group).worker_set.liveness_count().fetch_add(1, Ordering::Relaxed);
-  let ralloc = addr_of_mut!((*worker.work_group).ralloc);
-  let mut sralloc = SubRegionAllocator::new(ralloc);
-  let mut workset = TaskSet::<TaskCacheSize>{
-    inline_tasks:InlineLoopBuffer::new(),
-    outline_tasks: Array::new(ralloc)
+// this thing is created with intention to
+// metigate the situation when local objects contain
+// too many stale pages. We ask those objects to give away pages
+// they dont use and put them to use somewhere else.
+struct PageRerouter<const Capacity:usize> {
+  subscribed_donors: InlineLoopBuffer<Capacity, *mut dyn DrainablePageHolder>,
+  ralloc: *mut RootAllocator
+}
+impl <const Capacity:usize> PageRerouter<Capacity> {
+  fn new(ralloc: *mut RootAllocator) -> Self {
+    Self { subscribed_donors: InlineLoopBuffer::new(), ralloc }
+  }
+  fn register(&mut self, new_donor: *mut dyn DrainablePageHolder) {
+    let ok = self.subscribed_donors.push_to_tail(new_donor);
+    assert!(ok);
+  }
+  fn get_page(&mut self) -> Block4KPtr { unsafe {
+    let mut iter = LoopBufferTraverser::new(&self.subscribed_donors);
+    loop {
+      let maybe_donor = iter.next();
+      if let Some(donor) = maybe_donor {
+        let maybe_page = (&mut **donor).try_drain_page();
+        if let Some(page) = maybe_page {
+          return page
+        }
+      } else {
+        let page = (&mut *self.ralloc).get_block();
+        return page
+      };
+    }
+  }; }
+}
+impl <const Capacity:usize> DrainablePageHolder for PageRerouter<Capacity> {
+  fn try_drain_page(&mut self) -> Option<Block4KPtr> {
+      Some(self.get_page())
+  }
+}
+
+struct AcquiredIsolates {
+  index: usize,
+  storage: Vec<SomeIsolateRef>
+}
+impl AcquiredIsolates {
+  fn add(&mut self, iso_ref:SomeIsolateRef) {
+    self.storage.push(iso_ref)
+  }
+  fn remove_at_index(&mut self, index:usize) {
+    let _ = self.storage.swap_remove(index);
+    if self.index != 0 { self.index -= 1 }
+  }
+  fn get_next_pending_index(&mut self) -> Option<usize> {
+    let count = self.storage.len();
+    if count == 0 { return None }
+    let return_index = self.index;
+    self.index += 1;
+    if self.index == count { self.index = 0 }
+    return Some(return_index)
+  }
+}
+
+type CommonWorkerInnerContext = WorkerInnerContext<4, TASK_CACHE_SIZE>;
+struct WorkerInnerContext<const S0:usize, const S1:usize> {
+  page_router: PageRerouter<S0>,
+  allocator: SubRegionAllocator,
+  workset: TaskSet<S1>,
+  acquired_isolates: AcquiredIsolates,
+}
+
+const TASK_CACHE_SIZE:usize = 16;
+
+fn worker_processing_routine(worker: &mut Worker) { unsafe {
+  let ok = core_affinity::set_for_current(worker.core_id);
+  assert!(ok, "failed to pin worker {} to core {:?}", worker.index, worker.core_id);
+  let ralloc = addr_of_mut!((&mut *worker.work_group).ralloc);
+  let mut inner_context = {
+    let mut ctx: CommonWorkerInnerContext = garbage!();
+    let router_ptr = addr_of_mut!(ctx.page_router);
+    router_ptr.write(PageRerouter::<4>::new(ralloc));
+    addr_of_mut!(ctx.allocator).write(SubRegionAllocator::new(router_ptr));
+    addr_of_mut!(ctx.workset).write(TaskSet::<TASK_CACHE_SIZE>{
+      inline_tasks:InlineLoopBuffer::new(),
+      outline_tasks: Array::new(router_ptr)
+    });
+    addr_of_mut!(ctx.acquired_isolates).write(
+      AcquiredIsolates { index: 0, storage: Vec::new() });
+    ctx.page_router.register(&mut ctx.workset.outline_tasks);
+    ctx
   };
-  let workset_ = addr_of_mut!(workset);
-  let sralloc_ = addr_of_mut!(sralloc);
-  *worker.task_share_port.assume_init_mut() = workset_;
-  *worker.srallocator_ref.assume_init_mut() = sralloc_;
-  fence(Ordering::Release);
+  worker.inner_context_ptr.write(addr_of_mut!(inner_context));
+  fence(Ordering::Release); // publish context init to the consumer
   worker.flags.mark_as_initialised();
-  while !worker.flags.is_work_submited() { yield_now(); }
+
+  while !worker.flags.is_first_work_submited() {}
   fence(Ordering::Acquire);
-  worker.flags.unmark_work_as_submited();
-  let task_context = TaskContext::new(sralloc_, workset_);
+
+  let workset_ = addr_of_mut!(inner_context.workset);
+  let task_context = TaskContext::new(&mut inner_context, worker.work_group);
+  let task_context_ref = &mut *task_context.0.get();
+  let mut immidiate_state = ImmidiateState {
+    spawned_subtask_count: 0,
+    slot_for_dormant_parent_task: null_mut(),
+    region_ref: MaybeUninit::uninit(),
+    current_task: garbage!()
+  };
+  task_context_ref.immidiate_state = addr_of_mut!(immidiate_state);
+
+  let mut index = None;
   'quantum:loop {
-    match (*workset_).pop() {
-      Some(task) => {
-        let mut current_task = task;
-        let mut current_thunk = current_task.action.project_fun_ptr();
-        task_context.set_current_task_ref(&current_task);
-        'local_work:loop {
-          let continuation = current_thunk(&task_context); // do work
-          fence(Ordering::Release);
-          let is_childless_task = task_context.spawned_subtask_count() == 0;
-          match (continuation, is_childless_task) {
-            (Continuation::Next(next_thunk), true) => {
-              // task need not await its children.
-              // just go ahead
-              current_thunk = next_thunk;
-              continue 'local_work;
-            },
-            (Continuation::Next(next_thunk), false) => {
-              // this task has been parked and last child
-              // will put it back in action
-              task_context.fix_continuation(next_thunk);
-              task_context.inject_propper_lock_count();
-              task_context.clear_dirty_state();
-              // give some work away if there is too much of it
-              share_work_if_appropriate(worker, workset_);
-              continue 'quantum;
-            },
-            (Continuation::Stop, false) => {
-              // this task wont be awaken, but there are subtasks which
-              // might use its frame.
-              // mark it dead such that the last child
-              // disposes the frame
-              task_context.mark_current_task_as_dead();
-              task_context.inject_propper_lock_count();
-              task_context.clear_dirty_state();
-              // give some work away if there is too much of it
-              share_work_if_appropriate(worker, workset_);
-              continue 'quantum;
-            },
-            (Continuation::Stop, true) => {
-              // this is a terminal step
-              let should_drop_lock_count = current_task.action.mref_flags().is_parent_waker();
-              let current_frame_delete = current_task.frame_ptr;
-              if should_drop_lock_count {
-                let frame_ptr = current_frame_delete.deref();
-                let mtd = &*frame_ptr.cast::<ParentedTaskMetadata>();
-                let parked_parent_slot = addr_of!(mtd.mref_internals().parent_task_ref).read();
-                let parent_task = parked_parent_slot.deref().cast::<Task>().read();
-                let parent_frame = parent_task.frame_ptr.deref();
-                let parent_mtd = &*parent_frame.cast::<ParentedTaskMetadata>();
-                let lock_count = parent_mtd.mref_internals().lock_count.fetch_sub(1, Ordering::Relaxed);
-                let last_child = lock_count - 1 == 0;
-                let parent_dead = parent_task.action.mref_flags().is_dead();
-                match (last_child, parent_dead) {
-                  (true, true) => {
-                    fence(Ordering::AcqRel);
-                    sralloc.dispose(parked_parent_slot);
-                    sralloc.dispose(current_frame_delete);
-                    sralloc.dispose(parent_task.frame_ptr);
-                    continue 'quantum;
-                  },
-                  (true, false) => {
-                    fence(Ordering::AcqRel);
-                    sralloc.dispose(current_frame_delete);
-                    sralloc.dispose(parked_parent_slot);
-                    current_task = parent_task;
-                    current_thunk = current_task.action.project_fun_ptr();
-                    task_context.set_current_task_ref(&current_task);
-                    continue 'local_work;
-                  },
-                  (false, _) => {
-                    sralloc.dispose(current_frame_delete);
-                    continue 'quantum
-                  }
-                }
-              } else {
-                // we are not responsible for anybody!
-                // this inludes synchronization
-                sralloc.dispose(current_frame_delete);
-                continue 'quantum;
-              }
-            },
-          }
-        }
-      },
-      None => {
-        // there is no work locally present to be done.
-        let last_working = worker.mark_retire();
-        if last_working {
-          // all work is done now. we hand awaiting thread the disposition procedure
-          for ix in 0 .. (*worker.work_group).worker_set.total_worker_count() {
-            if ix == worker.index { continue }
-            let there = (*worker.work_group).worker_set.mref_worker_at_index(ix).unwrap();
-            there.flags.mark_self_kill();
-            while !there.flags.is_marked_for_suspend() {}
-            loop {
-              there.wakeup();
-              if !there.flags.is_marked_for_suspend() { break }
-            }
-          }
-          let work_group = &(*worker.work_group);
-          while work_group.sigkill.load(Ordering::Relaxed) != 1 { yield_now() }
-          work_group.sigkill.store(2, Ordering::Release);
-          work_group.completion_awaiting_thread.assume_init_read().unpark();
+    if let Some(task) = (*workset_).deque() {
+      immidiate_state.current_task = task;
+    } else {
+      if let i@Some(_) = inner_context.acquired_isolates.get_next_pending_index() {
+        index = i;
+      } else {
+        // not queue has any work to be done nor isolates has any work to offer.
+        // try go dormant
+        let selfkill = suspend(&worker);
+        if selfkill {
           return; // goodbye sweet prince
-        } else {
-          // go idle. maybe other workers will share a few more tasks
-          let selfkill = suspend(&worker);
-          if selfkill {
-            return; // goodbye sweet prince
-          }
-          worker.unmark_retire();
         }
+        continue;
+      }
+    }
+    let mut current_thunk = immidiate_state.current_task.action.project_fun_ptr();
+    'local_work:loop {
+      let continuation = {
+        if let Some(index_) = index {
+          index = None;
+          immidiate_state.current_task = Task {
+            action:Action::new_null(), frame_ptr:SubRegionRef::new_null()};
+          let iso_ref = inner_context.acquired_isolates.storage.get_unchecked(index_);
+          let (reg, off) = iso_ref.0.get_components();
+          let iso_ptr = reg.cast::<u8>().add(off as usize);
+          let meta = &*iso_ptr.cast::<IsolateMetadata>();
+          let val = meta.send_method_impl.fetch_or(
+            IsolateMetadata::BEING_PROCESSED_BIT, Ordering::Relaxed);
+          let being_handled = val & IsolateMetadata::BEING_PROCESSED_BIT != 0;
+          if being_handled { continue 'quantum }
+          fence(Ordering::Acquire);
+          let data_offset = meta.offset_to_data();
+          let data_ptr = iso_ptr.add(data_offset).cast();
+          let resolver = transmute::<_, UniversalMsgRespondSig>(meta.respond_method_impl);
+          let maybe_cont = resolver(data_ptr, &task_context);
+          let _ = meta.send_method_impl.fetch_and(
+            !IsolateMetadata::BEING_PROCESSED_BIT, Ordering::Release);
+          let cont = if let Some(cont) = maybe_cont { cont } else {
+            let ilc = meta.liveness_count.load(Ordering::Relaxed);
+            if ilc == 1 { // we are the last observer of this isolate
+              (meta.destructor)(data_ptr);
+              inner_context.allocator.dispose(transmute_copy(&iso_ref.0));
+              inner_context.acquired_isolates.remove_at_index(index_);
+            };
+            continue 'quantum;
+          };
+          cont
+        } else {
+          let cont = current_thunk(&task_context);
+          fence(Ordering::Release);
+          // we want to see all thunk invocations as happened
+          // when we'll read the subtasks lock count as 0.
+          // not nescessarily in global order relative to each other
+          // but in the global order relative to the worker
+          // reading 0 on child task count
+          cont
+        }
+      };
+      let produced_subtasks = immidiate_state.spawned_subtask_count != 0;
+      match (continuation, produced_subtasks) {
+        (Continuation::Rerun, true) => {
+          immidiate_state.current_task.action.set_fun_ptr(current_thunk);
+          if immidiate_state.current_task.frame_ptr.is_null() {
+            immidiate_state.current_task.frame_ptr = inner_context.allocator.sralloc(
+              size_of::<ChildrenCountTaskMetadataView>(), align_of::<ChildrenCountTaskMetadataView>());
+          };
+          (*immidiate_state.current_task.frame_ptr.deref().cast::<ChildrenCountTaskMetadataView>())
+            .mref_internals().lock_count = AtomicU64::new(immidiate_state.spawned_subtask_count);
+          *immidiate_state.slot_for_dormant_parent_task =
+            transmute_copy(&immidiate_state.current_task);
+          task_context.clear_dirty_state();
+          schedule_work(worker, workset_);
+          continue 'quantum
+        },
+        (Continuation::Rerun, false) => {
+          // this has drawbacks which seem impossible to counter.
+          // the worst case is the workset gets bubbled with tasks
+          // that get reruned waiting for system to serve their requests.
+          // this could either slow down doing usefull work or in a really bad
+          // scenario turn worker into a blocked thread.
+          // TODO: make some clever fix for this
+          immidiate_state.current_task.action.set_fun_ptr(current_thunk);
+          let copied_task : Task = transmute_copy(&immidiate_state.current_task);
+          inner_context.workset.outline_tasks.push(copied_task);
+          continue 'quantum
+        },
+        (Continuation::Then(next_thunk), false) => {
+          // task need not await its children.
+          // or do pretty much anything fancy
+          current_thunk = next_thunk;
+          continue 'local_work;
+        },
+        (Continuation::Then(next_thunk), true) => {
+          // this task has been parked and last child
+          // will put it back in action
+          immidiate_state.current_task.action.set_fun_ptr(next_thunk);
+          // set lock count
+          if immidiate_state.current_task.frame_ptr.is_null() {
+            immidiate_state.current_task.frame_ptr = inner_context.allocator.sralloc(
+              size_of::<ChildrenCountTaskMetadataView>(), align_of::<ChildrenCountTaskMetadataView>());
+          };
+          (*immidiate_state.current_task.frame_ptr.deref().cast::<ChildrenCountTaskMetadataView>()).mref_internals().lock_count = AtomicU64::new(immidiate_state.spawned_subtask_count);
+          *immidiate_state.slot_for_dormant_parent_task =
+            transmute_copy(&immidiate_state.current_task);
+          task_context.clear_dirty_state();
+          schedule_work(worker, workset_);
+          continue 'quantum;
+        },
+        (Continuation::Done, true) => {
+          // last child is responsible for frame of the parrent
+          immidiate_state.current_task.action.mref_flags().mark_as_dead();
+          // set lock count
+          if immidiate_state.current_task.frame_ptr.is_null() {
+            immidiate_state.current_task.frame_ptr = inner_context.allocator.sralloc(
+              size_of::<ChildrenCountTaskMetadataView>(), align_of::<ChildrenCountTaskMetadataView>());
+          };
+          (*immidiate_state.current_task.frame_ptr.deref().cast::<ChildrenCountTaskMetadataView>()).mref_internals().lock_count = AtomicU64::new(immidiate_state.spawned_subtask_count);
+          *immidiate_state.slot_for_dormant_parent_task =
+            transmute_copy(&immidiate_state.current_task);
+          task_context.clear_dirty_state();
+          schedule_work(worker, workset_);
+          continue 'quantum;
+        },
+        (Continuation::Done, false) => {
+          // this is a terminal step
+          let should_drop_lock_count =
+            immidiate_state.current_task.action.mref_flags().is_parent_waker();
+          let current_frame_delete: SubRegionRef =
+            transmute_copy(&immidiate_state.current_task.frame_ptr);
+          if should_drop_lock_count {
+            let frame_ptr = current_frame_delete.deref();
+            let mtd = &*frame_ptr.cast::<ParentedTaskMetadataView>();
+            let parked_parent_slot = addr_of!(mtd.mref_internals().parent_task_ref).read();
+            let parent_task = parked_parent_slot.deref().cast::<Task>().read();
+            let parent_frame = parent_task.frame_ptr.deref();
+            let parent_mtd = &*parent_frame.cast::<ParentedTaskMetadataView>();
+            let lock_count = parent_mtd.mref_internals().lock_count.fetch_sub(
+              1, Ordering::Relaxed);
+            let last_child = lock_count == 1;
+            let parent_dead = parent_task.action.mref_flags().is_dead();
+            match (last_child, parent_dead) {
+              (true, true) => {
+                // this syncs on subtask count. thunk exec in each subtask
+                // does not happen after the counter bump down, so the last task
+                // which sets it to 0, will never happen before any other sibling subtask.
+                // all uses of parent frame by subtasks will not cross this barier
+                fence(Ordering::Acquire);
+                inner_context.allocator.dispose(parked_parent_slot);
+                inner_context.allocator.dispose(current_frame_delete);
+                inner_context.allocator.dispose(parent_task.frame_ptr);
+                continue 'quantum;
+              },
+              (true, false) => {
+                fence(Ordering::Acquire); // same as above holds for this one
+                inner_context.allocator.dispose(current_frame_delete);
+                inner_context.allocator.dispose(parked_parent_slot);
+                immidiate_state.current_task = parent_task;
+                current_thunk = immidiate_state.current_task.action.project_fun_ptr();
+                continue 'local_work;
+              },
+              (false, _) => {
+                // this child only has to put its frame mem for recycle
+                inner_context.allocator.dispose(current_frame_delete);
+                continue 'quantum
+              }
+            }
+          } else {
+            // we dont have a parrent to carry about
+            if !current_frame_delete.is_null() {
+              inner_context.allocator.dispose(current_frame_delete);
+            }
+            continue 'quantum;
+          }
+        },
       }
     }
   }
 } }
 
 fn suspend(worker: &Worker) -> bool {
-  worker.flags.mark_for_suspend();
-  let _ = unsafe { &*worker.work_group }.worker_set.set_as_free(worker.index).unwrap();
+  worker.mark_as_free();
   let self_kill = loop {
-    if worker.flags.should_kill_self() {
+    if worker.flags.is_marked_for_termination() {
       break true
     };
     if worker.flags.has_transaction_began() {
@@ -574,215 +735,405 @@ fn suspend(worker: &Worker) -> bool {
     }
     park();
   };
-  fence(Ordering::Release);
-  worker.flags.unmark_for_suspend();
-
   return self_kill
 }
 
-fn share_work_if_appropriate<const C:usize>(
+fn schedule_work<const C:usize>(
   worker: *mut Worker, workset: *mut TaskSet<C>
 ) { unsafe {
   let workset = &mut *workset;
-  let local_item_count = workset.item_count();
-  let have_too_many_tasks = local_item_count > TaskCacheSize;
-  // ideally, there should be a weight metric for tasks
-  // so that we can definitevely determine when certain amount of tasks is
-  // actually too much to carry on by a single worker. but such a system would require
-  // more effort than I ready to give at the moment. some other day, maybe..
-  if have_too_many_tasks {
-    let worker_count = (*(*worker).work_group).worker_set.total_worker_count();
-    let inline_indicies = &(*(*worker).work_group).worker_set.inline_free_indicies();
-    let free_worker_count = {
-      let mask = !(!0u64 >> (64 - worker_count));
-      let ixs = inline_indicies.load(Ordering::Relaxed);
-      let filtered = (mask | ixs).count_zeros();
-      filtered
-    };
-    let aprox_split = local_item_count / 16;
-    let aprox_split = min(aprox_split, free_worker_count as usize);
-    let mut i = aprox_split;
-
-    let src = (*worker).task_share_port.assume_init_read();
-    if worker_count <= 64 {
-      loop {
-        let free_thread_indicies = inline_indicies.load(Ordering::Relaxed);
-        let free_thread_index = free_thread_indicies.trailing_ones();
-        if free_thread_index >= worker_count { return }
-        let target_mask = 1u64 << free_thread_index;
-        let prior = inline_indicies.fetch_or(target_mask, Ordering::Relaxed);
-        let worker_is_ours = prior & target_mask == 0;
-        if worker_is_ours {
-          let subordinate_worker =
-            (*(*worker).work_group).worker_set.mref_worker_at_index(free_thread_index)
-            .unwrap();
-          let already_inited = subordinate_worker.flags.is_initialised();
-          let dest ;
-          if !already_inited {
-            subordinate_worker.start();
-            while !subordinate_worker.flags.is_initialised() {}
-            fence(Ordering::Acquire);
-            dest = subordinate_worker.task_share_port.assume_init_read();
-            perform_task_transfer(src, dest);
-            fence(Ordering::Release);
-            subordinate_worker.flags.mark_work_as_submited();
-          } else {
-            dest = subordinate_worker.task_share_port.assume_init_read();
-            subordinate_worker.flags.mark_transaction_begin();
-            perform_task_transfer(src, dest);
-            subordinate_worker.flags.mark_transaction_end();
-            fence(Ordering::Release);
-            while !subordinate_worker.flags.is_marked_for_suspend() {}
-            fence(Ordering::Acquire);
-            loop {
-              subordinate_worker.wakeup();
-              if !subordinate_worker.flags.is_marked_for_suspend() { break }
-            }
+  let worker_set = &mut(*(*worker).work_group).worker_set;
+  // todo: use task weight metric
+  loop {
+    let local_item_count = workset.item_count();
+    let have_too_many_tasks = local_item_count > TASK_CACHE_SIZE;
+    if have_too_many_tasks {
+      let maybe_free_worker = worker_set.try_acquire_free_worker_mref();
+      match maybe_free_worker {
+        Some(subordinate_worker) => {
+          if !subordinate_worker.flags.was_started() {
+            subordinate_worker.start()
           }
-          i -= 1;
-          if i == 0 { return }
-        } else { continue; }
+          subordinate_worker.with_synced_access(|subordinate_worker|{
+            let src = &mut(&mut *((&mut *worker).inner_context_ptr).assume_init_read()).workset;
+            let dest = &mut (*subordinate_worker.inner_context_ptr.assume_init()).workset;
+            // todo: make transfers fast
+            let mut task_limit = 0;
+            loop {
+              if let Some(task) = src.deque() {
+                dest.enque(task);
+                task_limit += 1;
+                if task_limit == TASK_CACHE_SIZE { return }
+              } else {
+                return
+              }
+            }
+          });
+          continue;
+        },
+        None => {
+          return
+        }
       }
     } else {
-      todo!()
+      return
     }
   }
 } }
-fn perform_task_transfer(src: *mut TaskSet<TaskCacheSize>, dst: *mut TaskSet<TaskCacheSize>) { unsafe {
-  // this really needs the best possible performance for copying tasks into the reciever.
-  // employing some vector intrinsincs would be great! aing gonna do it  today, though
-  loop {
-    if let Some(task) = (*src).pop() {
-      (*dst).push(task)
-    } else {return };
-  }
-} }
 
-struct ParentedTaskMetadata(UnsafeCell<ParentedTaskMetadataInternals>);
-impl ParentedTaskMetadata {
-  fn mref_internals(&self) -> &mut ParentedTaskMetadataInternals {
+struct ParentedTaskMetadataView(UnsafeCell<ParentedTaskMetadataViewInternals>);
+impl ParentedTaskMetadataView {
+  fn mref_internals(&self) -> &mut ParentedTaskMetadataViewInternals {
     unsafe { &mut *self.0.get() }
   }
 }
-struct ParentedTaskMetadataInternals {
+#[repr(C)]
+struct ParentedTaskMetadataViewInternals {
   lock_count: AtomicU64,
   parent_task_ref: SubRegionRef
 }
-struct ParentlessTaskMetadata(UnsafeCell<ParentlessTaskMetadataInternals>);
-impl ParentlessTaskMetadata {
-  fn mref_internals(&self) -> &mut ParentlessTaskMetadataInternals {
+struct ChildrenCountTaskMetadataView(UnsafeCell<ChildrenCountTaskMetadataViewInternals>);
+impl ChildrenCountTaskMetadataView {
+  fn mref_internals(&self) -> &mut ChildrenCountTaskMetadataViewInternals {
     unsafe { &mut *self.0.get() }
   }
 }
-struct ParentlessTaskMetadataInternals {
+#[repr(C)]
+struct ChildrenCountTaskMetadataViewInternals {
   lock_count: AtomicU64,
 }
+pub struct Arc<T> { ref_count:AtomicU64, value:T }
+pub struct ArcBox<T>(SubRegionRef, PhantomData<T>);
+pub struct BasicBox<T>(SubRegionRef, PhantomData<T>);
+impl <T>ArcBox<T> {
+  fn as_mut_ptr(&mut self) -> *mut T { unsafe {
+    let val = &mut *self.0.deref().cast::<Arc<T>>();
+    return addr_of_mut!(val.value)
+  } }
+}
+impl <T> AsMut<T> for ArcBox<T> {
+  fn as_mut(&mut self) -> &mut T {
+    unsafe { &mut*self.as_mut_ptr() }
+  }
+}
+impl <T> AsRef<T> for ArcBox<T> {
+  fn as_ref(&self) -> &T { unsafe {
+    let val = &*self.0.deref().cast::<Arc<T>>();
+    return &val.value
+  } }
+}
 
-
+struct ImmidiateState {
+  current_task: Task,
+  spawned_subtask_count: u64,
+  slot_for_dormant_parent_task: *mut Task,
+  region_ref: MaybeUninit<SubRegionRef>,
+}
 pub struct TaskContext(UnsafeCell<TaskContextInternals>);
 struct TaskContextInternals {
-  spawned_subtask_count: u64,
-  fixup_target: *mut Task,
-  current_task_ref: *const Task,
-  region_ref: MaybeUninit<SubRegionRef>,
-  srallocator: *mut (),
-  taskset: *mut ()
+  immidiate_state: *mut ImmidiateState,
+  worker_inner_context_ref: *mut CommonWorkerInnerContext,
+  work_group_ref: *mut WorkGroup,
+}
+enum MsgStore {
+  Immidiate([u8;15]), Indirect(*mut u8)
 }
 impl TaskContext {
-  fn new<const C:usize>(
-    srallocator: *mut SubRegionAllocator,
-    taskset: *mut TaskSet<C>
+  fn new(
+    worker_inner_context: *mut CommonWorkerInnerContext,
+    worker_group_ref: *mut WorkGroup
   ) -> Self {
     TaskContext(UnsafeCell::new(TaskContextInternals {
-      spawned_subtask_count: 0,
-      current_task_ref: null_mut(),
-      fixup_target: null_mut(),
-      srallocator: srallocator as *mut (),
-      region_ref: MaybeUninit::uninit(),
-      taskset:taskset as *mut ()
+      immidiate_state: null_mut(),
+      work_group_ref: worker_group_ref,
+      worker_inner_context_ref: worker_inner_context,
     }))
   }
-  fn spawn_subtask<T: Sync + Send>(&self, env: T, thunk: Thunk) { unsafe {
-    self.idempotently_park_parent_task();
+  // false if fails
+  fn try_acustody_isolate(&self, iso_ref: SomeIsolateRef) -> bool { unsafe {
     let this = &mut *self.0.get();
-    this.spawned_subtask_count += 1;
-
-    let frame_alignment = align_of::<T>();
-    let frame_size = size_of::<T>();
-    let (real_frame_size, offset_order) =
-      adjusted_frame_size(frame_size, frame_alignment, size_of::<ParentedTaskMetadata>());
-    let offset_to_data = renorm_offset_order(offset_order);
-    // maybe remove this restriction
-    let frame_allocation_limit = 4096 - size_of::<RegionMetadata>();
-    if real_frame_size >= frame_allocation_limit {
-      panic!("FIXME:Cant allocate this much for a task frame.")
+    let maybe_worker = (*this.work_group_ref).worker_set.try_acquire_free_worker_mref();
+    if let Some(worker) = maybe_worker {
+      if !worker.flags.was_started() {
+        worker.start()
+      }
+      worker.with_synced_access(|worker| {
+        (*worker.inner_context_ptr.assume_init()).acquired_isolates.add(iso_ref)
+      });
+      return true
+    } else {
+      return false
     }
+  }; }
 
-    let sralloc = &mut *this.srallocator.cast::<SubRegionAllocator>();
-    let frame_ref = sralloc.srallocate(real_frame_size, align_of::<ParentedTaskMetadata>());
-    let frame_ptr = frame_ref.deref();
-    let mtd = (&mut *frame_ptr.cast::<ParentedTaskMetadata>()).mref_internals();
-    mtd.lock_count = AtomicU64::new(0);
-    mtd.parent_task_ref = this.region_ref.assume_init_read();
-    let data = frame_ptr.add(offset_to_data);
-    copy_nonoverlapping(addr_of!(env).cast(), data, frame_size);
-    forget(env);
-
-    let subtask = Task {action:Action::new(thunk), frame_ptr: frame_ref};
-    subtask.action.mref_flags().mark_as_parent_waker();
-    subtask.action.mref_flags().set_offset_order(offset_order as u8);
-
-    let task_set = &mut * this.taskset.cast::<TaskSet<TaskCacheSize>>();
-    task_set.push(subtask);
-  } }
-  fn spawn_detached_task(&self) {
-    todo!()
-  }
-  fn spawned_subtask_count(&self) -> u64 {
-    unsafe { &*self.0.get() }.spawned_subtask_count
-  }
-  fn clear_dirty_state(&self) {
-    let this = unsafe { &mut *self.0.get() };
-    this.spawned_subtask_count = 0;
-    this.fixup_target = null_mut();
-  }
-  fn set_current_task_ref(&self, task_ref: *const Task) {
-    unsafe { (&mut *self.0.get()).current_task_ref = task_ref } ;
-  }
-  fn fix_continuation(&self, thunk: Thunk) {
-    let fixup_target = unsafe { &mut *(&mut *self.0.get()).fixup_target } ;
-    fixup_target.action.set_fun_ptr(thunk);
-  }
-  fn mark_current_task_as_dead(&self) {
-    let mark_target = unsafe { &mut *(&mut *self.0.get()).fixup_target } ;
-    mark_target.action.mref_flags().mark_as_dead();
-  }
-  fn idempotently_park_parent_task(&self) { unsafe {
-    let this = &mut *self.0.get() ;
-    if this.fixup_target == null_mut() {
-      let srallocator = &mut *this.srallocator.cast::<SubRegionAllocator>();
-      let slot = srallocator.srallocate(size_of::<Task>(), align_of::<Task>());
-      let parked_task_ptr = slot.deref().cast::<Task>();
-      this.fixup_target = parked_task_ptr;
-      *parked_task_ptr = this.current_task_ref.read();
-      this.region_ref.as_mut_ptr().write(slot);
-    }
-  } }
-  fn inject_propper_lock_count(&self) { unsafe {
+  pub fn install_task_frame<T>(&self) { unsafe {
     let this = &mut *self.0.get();
-    let target = &mut *this.fixup_target;
-    let frame = target.frame_ptr.deref();
-    let mtd = &mut *frame.cast::<ParentedTaskMetadata>();
-    mtd.mref_internals().lock_count = AtomicU64::new(this.spawned_subtask_count);
+    let fptr = &mut (*this.immidiate_state).current_task.frame_ptr;
+    assert!(fptr.is_null(), "task already has a frame");
+    let flags = (*this.immidiate_state).current_task.action.mref_flags();
+    flags.set_offset_order(align_of::<T>() as u8);
+    let mut frame_size = size_of::<ChildrenCountTaskMetadataView>();
+    frame_size += offset_to_higher_multiple(frame_size as u64, align_of::<T>()) as usize;
+    frame_size += size_of::<T>();
+    let reg_ref = (*this.worker_inner_context_ref).allocator.sralloc(
+      frame_size, align_of::<ChildrenCountTaskMetadataView>());
+    *fptr = reg_ref;
   } }
-  fn access_frame<T>(&self) -> *mut T { unsafe {
+  pub fn access_task_frame<T>(&self) -> *mut T { unsafe {
     let this = &mut *self.0.get();
-    let task = &*this.current_task_ref;
-    let offset = task.action.mref_flags().get_offset_order_to_frame();
-    let normalised_offset = renorm_offset_order(offset as usize);
-    let data_offset = task.frame_ptr.deref().add(normalised_offset);
+    let task = &(*this.immidiate_state).current_task;
+    let offset = task.action.byte_offset_to_data();
+    let data_offset = task.frame_ptr.deref().add(offset);
     return data_offset.cast()
   }; }
+  // does not need destructor
+  pub fn spawn_basic_box<T>(&self, data:T) -> BasicBox<T> { unsafe {
+    assert!(!needs_drop::<T>(), "detected value with nontrivial destructor");
+    if size_of::<T>() == 0 {
+      return BasicBox(SubRegionRef::new_null(), PhantomData)
+    }
+    let this = &mut *self.0.get();
+    let region_ref = (*this.worker_inner_context_ref).allocator.sralloc(
+      size_of::<T>(), align_of::<T>());
+    let loc = region_ref.deref();
+    loc.cast::<T>().write(data);
+    return BasicBox(region_ref, PhantomData)
+  } }
+  pub fn dispose_basic_box<T>(&self, some_box: BasicBox<T>) { unsafe {
+    let this = &mut *self.0.get();
+    (*this.worker_inner_context_ref).allocator.dispose(some_box.0)
+  } }
+  pub fn spawn_rc_box<T>(&self, data:T) -> ArcBox<T> { unsafe {
+    assert!(needs_drop::<T>(), "value must provide a destructor");
+    let this = &mut *self.0.get();
+    let region_ref = (*this.worker_inner_context_ref).allocator.sralloc(
+      size_of::<Arc<T>>(), align_of::<Arc<T>>());
+    let loc = region_ref.deref();
+    let box_ = loc.cast::<Arc<T>>();
+    (*box_).ref_count = AtomicU64::new(1);
+    addr_of_mut!((*box_).value).write(data);
+    return ArcBox(region_ref, PhantomData)
+  }; }
+  pub fn dispose_rc_box<T>(&self, some_box: ArcBox<T>) { unsafe {
+    let val = &*some_box.0.deref().cast::<Arc<T>>();
+    let rc = val.ref_count.fetch_sub(1, Ordering::AcqRel);
+    if rc == 1 {
+      let this = &mut *self.0.get();
+      (*this.worker_inner_context_ref).allocator.dispose(some_box.0)
+    }
+  } }
+  // #[inline(never)]
+  // fn send_message_common_impl(
+  //   &self,
+  //   meta_ref: &IsolateMetadata,
+  //   data_ptr: *mut u8) {
+
+  // }
+  pub fn send_message<T:Isolate>(
+    &self,
+    reciever: &IsolateRef<T>,
+    message: T::Message,
+  ) -> T::MsgSendOutcome { unsafe {
+    let iso_ptr = reciever.0.deref();
+    let iso_meta = &*iso_ptr.cast::<IsolateMetadata>();
+    let mut send_impl_ptr ;
+    let mut smth ;
+    loop {
+      smth = iso_meta.send_method_impl.fetch_or(
+        IsolateMetadata::OWNERSHIP_BIT |
+        IsolateMetadata::BEING_PROCESSED_BIT, Ordering::AcqRel);
+      send_impl_ptr = smth & ((1 << 48) - 1);
+      if send_impl_ptr == 0 { continue; }
+      break;
+    }
+    let send = transmute::<_, UniversalMsgSendSig<T::MsgSendOutcome, T::Message>>(send_impl_ptr);
+
+    let mut offset = size_of::<IsolateMetadata>();
+    offset += offset_to_higher_multiple(offset as u64, align_of::<T>()) as usize;
+    let iso_data = iso_ptr.add(offset);
+    let send_outcome = send(
+      iso_data.cast(),
+      self,
+      message);
+
+    let idle = smth & IsolateMetadata::BEING_PROCESSED_BIT == 0;
+    let this = &mut *self.0.get();
+    if idle {
+      let resolve = transmute::<_, UniversalMsgRespondSig>(iso_meta.respond_method_impl);
+      let context_clone = transmute_copy::<_, TaskContext>(self);
+      let mut local_immidiate = ImmidiateState {
+        spawned_subtask_count: 0,
+        slot_for_dormant_parent_task: null_mut(),
+        region_ref: MaybeUninit::uninit(),
+        current_task: Task { action: Action::new_null(), frame_ptr: SubRegionRef::new_null() }
+      };
+      (*context_clone.0.get()).immidiate_state = addr_of_mut!(local_immidiate);
+
+      let outcome = resolve(iso_data.cast(), &context_clone);
+      let _ = iso_meta.send_method_impl.fetch_and(
+        !IsolateMetadata::BEING_PROCESSED_BIT, Ordering::Release);
+
+      if let Some(continuation) = outcome {
+        match continuation {
+          Continuation::Done =>
+            local_immidiate.current_task.action.set_fun_ptr(|_|{Continuation::Done}),
+          Continuation::Then(continuation) =>
+            local_immidiate.current_task.action.set_fun_ptr(continuation),
+          Continuation::Rerun => panic!("attempt to rerun the thunk which cannot be rerun")
+        };
+        let spwaned_subtasks = !local_immidiate.slot_for_dormant_parent_task.is_null();
+        if spwaned_subtasks {
+          // last child task will awake this one
+          if local_immidiate.current_task.frame_ptr.is_null() {
+            // we have to allocate minimal frame for subtaks to sync on
+            local_immidiate.current_task.frame_ptr =
+              (*this.worker_inner_context_ref).allocator.sralloc(
+                size_of::<ChildrenCountTaskMetadataView>(), align_of::<ChildrenCountTaskMetadataView>());
+          }
+          let ptr = local_immidiate.current_task.frame_ptr.deref();
+          (*ptr.cast::<ChildrenCountTaskMetadataView>()).mref_internals().lock_count =
+            AtomicU64::new(local_immidiate.spawned_subtask_count);
+          copy_nonoverlapping(
+            &local_immidiate.current_task, local_immidiate.slot_for_dormant_parent_task, 1);
+          // children will awake this task
+        } else {
+          // no subtask were spawne which would have awaken the parent.
+          // we are responsible for this task created by executing the deque operation
+          (*this.worker_inner_context_ref).workset.enque(local_immidiate.current_task);
+        }
+      }
+    }
+
+    let orphan = smth & IsolateMetadata::OWNERSHIP_BIT == 0;
+    if orphan {
+      let copied = reciever.copy_ref().erase_to_some();
+      let copy : SomeIsolateRef = transmute_copy(&copied);
+      // lets try to give this iso to an idle worker
+      let ok = self.try_acustody_isolate(copy);
+      if !ok {
+        // there were no available workers.
+        // we take this isolate
+        let copy = transmute_copy(&copied);
+        (*this.worker_inner_context_ref).acquired_isolates.add(copy);
+      }
+    }
+    return send_outcome
+  } }
+  pub fn spawn_isolate<T: Isolate>(&self, isolate: T) -> IsolateRef<T> {unsafe {
+    let this = &mut *self.0.get();
+    let mut data_dist = size_of::<IsolateMetadata>();
+    data_dist += offset_to_higher_multiple(data_dist as u64, align_of::<T>()) as usize;
+    let whole_size = data_dist + size_of::<T>();
+    let item = (*this.worker_inner_context_ref).allocator.sralloc(
+      whole_size, align_of::<IsolateMetadata>());
+    let raw = item.deref();
+    let meta = &mut *raw.cast::<IsolateMetadata>();
+    meta.respond_method_impl = T::respond_to_message as *mut () as u64;
+    meta.send_method_impl.store(0, Ordering::Relaxed);
+    meta.set_data_align_order(align_of::<T>());
+    meta.liveness_count = AtomicU64::new(1);
+    meta.destructor = transmute(drop_in_place::<T> as *mut ());
+    let data_ptr = raw.add(data_dist);
+    data_ptr.cast::<T>().write(isolate);
+    meta.send_method_impl.fetch_or(T::send_message as *mut () as u64, Ordering::Release);
+
+    return IsolateRef(item, PhantomData)
+  } }
+  pub fn dispose_isolate<T:Isolate>(&self, iso_ref: IsolateRef<T>) { unsafe {
+    let (reg, off) = iso_ref.0.get_components();
+    let iso_ptr = reg.cast::<u8>().add(off as usize);
+    let meta = &*iso_ptr.cast::<IsolateMetadata>();
+    let lc = meta.liveness_count.fetch_sub(1, Ordering::AcqRel);
+    if lc == 1 {
+      let data = iso_ptr.add(meta.offset_to_data());
+      (meta.destructor)(data.cast());
+      let this = &mut *self.0.get();
+      (*this.worker_inner_context_ref).allocator.dispose(iso_ref.0);
+    }
+  } }
+  // parents never get ahead of their children in the execution timeline.
+  // subtasks are never parentless
+  pub fn spawn_subtask<T: Send>(&self, env: T, thunk: Thunk) {
+    self.spawn_task_common_impl(
+      addr_of!(env).cast::<u8>(),
+      size_of::<T>(), align_of::<T>(), thunk, false);
+    forget(env)
+  }
+  // parent does not depend on this subtask
+  pub fn spawn_detached_task<T:Send>(&self, env: T, thunk: Thunk) {
+    self.spawn_task_common_impl(
+      addr_of!(env).cast::<u8>(),
+      size_of::<T>(), align_of::<T>(), thunk, true);
+    forget(env)
+  }
+  #[inline(never)]
+  fn spawn_task_common_impl(
+    &self,
+    env_ptr:*const u8, env_size:usize, env_align:usize,
+    thunk: Thunk, detached: bool
+  ) { unsafe {
+    let this = &mut *self.0.get();
+    let immidiate_state_ref = &mut *this.immidiate_state;
+    let frame_size = if detached {
+      size_of::<ChildrenCountTaskMetadataView>()
+    } else {
+      size_of::<ParentedTaskMetadataView>()
+    };
+    if !detached {
+      self.idempotently_aquire_parking_lot_for_parent_task();
+      immidiate_state_ref.spawned_subtask_count += 1;
+    }
+    let (real_frame_size, offset_order) =
+      adjusted_frame_size(env_size, env_align, frame_size);
+    let frame_ref = if env_size != 0 || !detached {
+      let frame_allocation_limit = 4096 - size_of::<RegionMetadata>();
+      if real_frame_size >= frame_allocation_limit {
+        panic!("FIXME:Cant allocate this much for a task frame.")
+      }
+      let sralloc = &mut (*this.worker_inner_context_ref).allocator;
+      let frame_ref = sralloc.sralloc(real_frame_size, align_of::<ParentedTaskMetadataView>());
+      let frame_ptr = frame_ref.deref();
+      let mtd = (*frame_ptr.cast::<ChildrenCountTaskMetadataView>()).mref_internals();
+      mtd.lock_count = AtomicU64::new(0);
+      if !detached {
+        let mtd = (&mut *frame_ptr.cast::<ParentedTaskMetadataView>()).mref_internals();
+        mtd.parent_task_ref = immidiate_state_ref.region_ref.assume_init_read();
+      }
+      let offset_to_data = renorm_offset_order(offset_order);
+      let data = frame_ptr.add(offset_to_data);
+      copy_nonoverlapping(env_ptr, data, env_size);
+      frame_ref
+    } else {
+      SubRegionRef::new_null()
+    };
+    let subtask = Task {action:Action::new(thunk), frame_ptr: frame_ref};
+    subtask.action.mref_flags().set_offset_order(offset_order as u8);
+    if !detached {
+      subtask.action.mref_flags().mark_as_parent_waker();
+    }
+    let task_set = &mut (*this.worker_inner_context_ref).workset;
+    task_set.enque(subtask);
+  }; }
+  fn clear_dirty_state(&self) {
+    let this = unsafe { &mut *self.0.get() };
+    let imm_ctx = unsafe{&mut *this.immidiate_state};
+    imm_ctx.spawned_subtask_count = 0;
+    imm_ctx.slot_for_dormant_parent_task = null_mut();
+  }
+  fn idempotently_aquire_parking_lot_for_parent_task(&self) { unsafe {
+    let this = &mut *self.0.get() ;
+    let imm_ctx = &mut *this.immidiate_state;
+    if imm_ctx.slot_for_dormant_parent_task == null_mut() {
+      let srallocator = &mut (*this.worker_inner_context_ref).allocator;
+      let slot = srallocator.sralloc(size_of::<Task>(), align_of::<Task>());
+      let parked_task_ptr = slot.deref().cast::<Task>();
+      imm_ctx.slot_for_dormant_parent_task = parked_task_ptr;
+      imm_ctx.region_ref.as_mut_ptr().write(slot);
+    }
+  } }
+  pub fn reschedule_this_thunk(&self) {
+    todo!()
+  }
 }
 // (real_frame_size, offset_order)
 fn adjusted_frame_size(env_size: usize, env_align:usize, mtd_size: usize) -> (usize, usize) { unsafe {
@@ -834,7 +1185,7 @@ impl TaskFlags {
     let combined = off | transplanted;
     self.0[1] = combined;
   }
-  fn get_offset_order_to_frame(&self) -> u8 {
+  fn get_offset_order_of_frame(&self) -> u8 {
     let off = 0b111 << 5;
     let proj = self.0[1] & off;
     let projnorm = proj >> 5;
@@ -842,12 +1193,14 @@ impl TaskFlags {
   }
 }
 
-#[derive(Clone, Copy)]
 pub enum Continuation {
-  Stop, Next(Thunk)
+  Done,
+  Then(Thunk),
+  Rerun
 }
 type Thunk = fn (&TaskContext) -> Continuation;
 struct Action(UnsafeCell<ActionInternals>);
+#[repr(align(8))]
 struct ActionInternals([u8;6],[u8;2]);
 impl Action {
   fn new_null() -> Self { cast!(0u64, _) }
@@ -876,14 +1229,19 @@ impl Action {
     let intptr = fun_ptr as u64;
     copy_nonoverlapping(addr_of!(intptr) as *mut u8, ptr, 6);
   } }
-  // fn done() -> Self {
-  //   let null = Self::new_null();
-  //   null.mref_flags().mark_as_terminator();
-  //   return null;
-  // }
+  fn byte_offset_to_data(&self) -> usize {
+    let f = self.mref_flags();
+    let mut off = if f.is_parent_waker() {
+      size_of::<ParentedTaskMetadataView>()
+    } else {
+      size_of::<ChildrenCountTaskMetadataView>()
+    };
+    off += offset_to_higher_multiple(off as u64, 1usize << f.get_offset_order_of_frame()) as usize;
+    return off
+  }
 }
 
-fn example(ctx: &TaskContext) -> Continuation { Continuation::Next(example) }
+fn example(ctx: &TaskContext) -> Continuation { Continuation::Then(example) }
 #[test]
 fn action_is_not_bullshit() {
   let a = Action::new(example);
@@ -905,7 +1263,13 @@ pub struct WorkGroup {
 
 impl WorkGroup {
   pub fn new<T: Sync + Send>(env: T, head: Thunk) -> Box<Self> { unsafe {
-    let thread_count = 2 ;
+    let core_ids = core_affinity::get_core_ids().unwrap_or_else(||{
+      panic!("cannot retrieve core indicies")
+    });
+    let thread_count = core_ids.len();
+    if thread_count > 64 {
+      panic!("fixme: write impls for some stuff here and there")
+    }
     let boxed = alloc(
       Layout::from_size_align_unchecked(size_of::<Self>(), align_of::<Self>()));
     let boxed = boxed.cast::<Self>();
@@ -915,62 +1279,71 @@ impl WorkGroup {
         inline_workers:MaybeUninit::uninit().assume_init(),
         outline_workers: None,
         inline_free_indicies: AtomicU64::new(0),
-        liveness_count: AtomicU32::new(0),
         outline_free_indicies: None,
-        total_worker_count: thread_count,
+        total_worker_count: thread_count as u32,
       })),
       completion_awaiting_thread: MaybeUninit::uninit(),
       sigkill: AtomicU8::new(0)
     });
     let boxed_ = boxed;
-    for ix in 0 .. thread_count {
-      let wref = (*boxed_).worker_set.mref_worker_at_index(ix).unwrap();
+    let items = zip(0.., core_ids);
+    for (ix, cid) in items {
+      let wref = (*boxed_).worker_set.mref_worker_at_index(ix);
       let worker = Worker {
         index: ix,
         runner_handle: None,
         work_group: boxed_,
         flags: WorkerFlags::new(),
-        task_share_port: MaybeUninit::uninit(),
-        srallocator_ref: MaybeUninit::uninit()
+        inner_context_ptr: MaybeUninit::uninit(),
+        core_id: cid
       };
       cast!(wref, *mut Worker).write(worker);
     }
-    let initiator = (*boxed_).worker_set.mref_worker_at_index(0).unwrap();
-    fence(Ordering::Release);
-    initiator.flags.mark_for_first_init();
+    let initiator = (*boxed_).worker_set.mref_worker_at_index(0);
     initiator.start();
-    let (frame, mtd, data) = (*initiator.srallocator_ref.assume_init_read()).srallocate_frame(
-      size_of::<T>(),
-      align_of::<T>(),
-      size_of::<ParentlessTaskMetadata>());
-    copy_nonoverlapping(addr_of!(env).cast(), data, size_of::<T>());
-    forget(env);
-    let mtd = (&mut *mtd.cast::<ParentlessTaskMetadata>()).mref_internals();
-    mtd.lock_count = AtomicU64::new(0);
-    let initial_task = Task {
-      action: Action::new(head),
-      frame_ptr: frame
-    };
-    (*initiator.task_share_port.assume_init_read()).push(initial_task);
-    fence(Ordering::Release);
-    initiator.flags.mark_work_as_submited();
-
+    initiator.with_synced_access(|worker|{
+      let ctx = &mut *worker.inner_context_ptr.assume_init();
+      let mut initial_task = garbage!(Task);
+      initial_task.frame_ptr = if size_of::<T>() != 0 {
+        let mut size = size_of::<ChildrenCountTaskMetadataView>();
+        size += offset_to_higher_multiple(size as u64, align_of::<T>()) as usize;
+        let dist_to_data = size;
+        size += size_of::<T>();
+        let frame = ctx.allocator.sralloc(
+          size, align_of::<ChildrenCountTaskMetadataView>());
+        let task_slot = frame.deref();
+        let task_meta = &*task_slot.cast::<ChildrenCountTaskMetadataView>();
+        task_meta.mref_internals().lock_count = AtomicU64::new(0);
+        let task_data_ptr = task_slot.add(dist_to_data);
+        task_data_ptr.cast::<T>().write(env);
+        frame
+      } else {
+        SubRegionRef::new_null()
+      };
+      initial_task.action = Action::new(head);
+      ctx.workset.enque(initial_task);
+    });
     let boxed = Box::from_raw(boxed);
     return boxed
   } }
   pub fn await_completion(&mut self) { unsafe {
-    self.completion_awaiting_thread.as_mut_ptr().write(current()) ;
-    self.sigkill.store(1, Ordering::Release);
+    let wsd = &mut(*self.worker_set.0.get());
     loop {
-      park();
-      if self.sigkill.load(Ordering::Relaxed) == 2 { break }
+      let ixs = wsd.inline_free_indicies.load(Ordering::Relaxed);
+      if ixs == 0 {
+        if let Some(_) = wsd.outline_workers {
+          todo!()
+        };
+        break
+      }
+      yield_now()
     }
-    fence(Ordering::Acquire);
-    assert!(self.worker_set.liveness_count().load(Ordering::Relaxed) == 0);
     let worker_set = addr_of_mut!(self.worker_set);
-    let total_worker_count = (*worker_set).total_worker_count();
+    let total_worker_count = wsd.total_worker_count;
     for ix in 0 .. total_worker_count {
-      let wref = (*worker_set).mref_worker_at_index(ix).unwrap();
+      let wref = (*worker_set).mref_worker_at_index(ix);
+      wref.flags.mark_for_termination();
+      wref.wakeup();
       wref.terminate();
     }
   } }
@@ -1011,16 +1384,30 @@ fn frame_aligner() {
 
 #[test]
 fn test_trivial_tasking() {
-
   static mut evil_formula : &str = "";
   fn single_print(ctx: &TaskContext) -> Continuation {
     unsafe { evil_formula = "CH3O2"; }
-    return Continuation::Stop;
+    return Continuation::Done;
   }
 
   let mut work_group = WorkGroup::new((), single_print);
   work_group.await_completion();
   assert!("CH3O2" == unsafe { evil_formula });
+}
+#[test]
+fn non_basic_box_spawninng() {
+  const val : &str = "may dark days last least";
+  fn single_print(ctx: &TaskContext) -> Continuation {
+    let box_ = ctx.spawn_rc_box(String::from_str(val).unwrap());
+    ctx.install_task_frame::<String>();
+    return Continuation::Then(|ctx|{
+
+      return Continuation::Done
+    });
+  }
+
+  let mut work_group = WorkGroup::new((), single_print);
+  work_group.await_completion();
 }
 
 #[test]
@@ -1029,11 +1416,11 @@ fn one_shild_one_parent() {
   static mut name: &str = "";
   fn parent(ctx: &TaskContext) -> Continuation {
     ctx.spawn_subtask((), child);
-    return Continuation::Stop
+    return Continuation::Done
   }
   fn child(ctx: &TaskContext) -> Continuation {
     unsafe { name = "I am Jason";};
-    return Continuation::Stop;
+    return Continuation::Done;
   }
 
   let mut work_group = WorkGroup::new((), parent);
@@ -1044,30 +1431,30 @@ fn one_shild_one_parent() {
 
 #[test]
 fn child_child_check_dead() {
-  const Limit:usize = 10000;
+  const Limit:usize = 4 * 1000;
   struct ParentData { counter: AtomicU64, str: String, iter: u64 }
   fn parent(ctx: &TaskContext) -> Continuation {
-    let frame = unsafe { &mut *ctx.access_frame::<ParentData>() };
+    let frame = unsafe { &mut *ctx.access_task_frame::<ParentData>() };
     // println!("{}", frame.str);
     for _ in 0 .. Limit {
       ctx.spawn_subtask(&frame.counter, child);
     }
     // if frame.iter == 0 { return Continuation::Next(check)}
     // frame.iter -= 1;
-    return Continuation::Next(check)
+    return Continuation::Then(check)
   }
   fn child(ctx: &TaskContext) -> Continuation {
-    let counter = unsafe { &*ctx.access_frame::<&AtomicU64>() };
+    let counter = unsafe { &*ctx.access_task_frame::<&AtomicU64>() };
     let _ = counter.fetch_add(1, Ordering::Relaxed);
-    return Continuation::Stop;
+    return Continuation::Done;
   }
   fn check(ctx: &TaskContext) -> Continuation {
-    let frame = unsafe { &*ctx.access_frame::<ParentData>() };
+    let frame = unsafe { &*ctx.access_task_frame::<ParentData>() };
     let val = frame.counter.load(Ordering::Relaxed);
     // assert!(val == Limit as u64);
     println!("{}", val);
 
-    return Continuation::Stop
+    return Continuation::Done
   }
 
   let str = String::from_str("are you okay pal?").unwrap();
@@ -1075,13 +1462,339 @@ fn child_child_check_dead() {
   let mut work_group = WorkGroup::new(frame, parent);
   work_group.await_completion();
   unsafe {
-    let relc = release_count.load(Ordering::Relaxed);
-    let acqc = acquire_count.load(Ordering::Relaxed);
+    let relc = ALLOCATION_COUNT.load(Ordering::Relaxed);
+    let acqc = DEALLOCATION_COUNT.load(Ordering::Relaxed);
+    println!("{} {}", acqc, relc);
+    assert!(relc == acqc);
+  }
+}
+
+
+struct IsolateFlags(AtomicU8);
+impl IsolateFlags {
+  fn new() -> Self { Self(AtomicU8::new(0))}
+  fn set_msg_align(&self, align: u8) {
+    let order = high_order_pow2(align as u64) - 1;
+    if order > 0b1111 { panic!("align is too big") }
+    let erased = self.0.load(Ordering::Acquire) & (!0 << 4);
+    let replaced = erased | (order as u8);
+    self.0.store(replaced, Ordering::Release)
+  }
+  fn get_msg_align(&self) -> u8 {
+    let val = self.0.load(Ordering::Acquire);
+    let val = val & 0b1111;
+    return val + 1
+  }
+  // false if already serviced
+  fn try_claim_ownership(&self) -> bool {
+    let prior = self.0.fetch_or(1 << 4, Ordering::AcqRel);
+    prior & (1 << 4) == 0
+  }
+}
+#[repr(C)]
+struct IsolateMetadata {
+  send_method_impl: AtomicU64,
+  respond_method_impl: u64,
+  liveness_count: AtomicU64,
+  destructor: fn(*mut())
+}
+impl IsolateMetadata {
+  const OWNERSHIP_BIT: u64 = 1 << 48;
+  // false if already owned
+  fn try_claim_ownership(&self, order: Ordering) -> bool {
+    let prior = self.send_method_impl.fetch_or(Self::OWNERSHIP_BIT, order);
+    let already_owned = prior & Self::OWNERSHIP_BIT != 0;
+    return already_owned
+  }
+  const BEING_PROCESSED_BIT: u64 = 1 << 49;
+  fn try_mark_as_being_processed(&self, order: Ordering) -> bool {
+    todo!()
+  }
+  fn set_data_align_order(&self, align: usize) {
+    let order = high_order_pow2(align as u64);
+    assert!(order <= 0b1111);
+    let _ = self.send_method_impl.fetch_or(order << 60 , Ordering::Relaxed);
+  }
+  fn get_data_align_order(&self) -> u8 {
+    let i = self.send_method_impl.load(Ordering::Relaxed);
+    let v = i >> 60;
+    return v as u8
+  }
+  fn offset_to_data(&self) -> usize {
+    let align = 1 << self.get_data_align_order();
+    let mut offset = size_of::<Self>();
+    offset += offset_to_higher_multiple(offset as u64, align) as usize;
+    return offset
+  }
+}
+
+#[test] #[ignore]
+fn mem_locations() { unsafe {
+  let memer = || {
+    alloc(Layout::from_size_align_unchecked(1 << 21, 4096))
+  };
+  let mut highs = 0;
+  for _ in 0 .. 16 {
+    let mem_addr = memer();
+    let k = ((mem_addr as u64) >> 12) >> 32;
+    if highs == 0 { highs = k } else {
+      assert!(highs == k);
+    }
+  }
+} }
+
+pub struct IsolateRef<T:Isolate>(SubRegionRef, PhantomData<T>);
+impl <T:Isolate> IsolateRef<T> {
+  fn copy_ref(&self) -> Self { unsafe {
+    let iso_ptr = self.0.deref();
+    let iso_meta = &*iso_ptr.cast::<IsolateMetadata>();
+    let _ = iso_meta.liveness_count.fetch_add(1, Ordering::AcqRel);
+    let new = transmute_copy::<_, SubRegionRef>(&self.0);
+    return Self(new, PhantomData)
+  } }
+  fn erase_to_some(self) -> SomeIsolateRef {
+    unsafe { transmute(self) }
+  }
+}
+impl <T:Isolate> Clone for IsolateRef<T> {
+  fn clone(&self) -> Self {
+    self.copy_ref()
+  }
+}
+
+pub struct SomeIsolateRef(SubRegionRef);
+
+type UniversalMsgSendSig<T, K> =
+  fn (*const (), &TaskContext, K) -> T;
+type UniversalMsgRespondSig = fn (*mut (), &TaskContext) -> Option<Continuation>;
+pub trait Isolate {
+  type Message: Send ;
+  type MsgSendOutcome ;
+  type SyncView: Sync ;
+  // this method can be called from multiple threads
+  fn send_message(
+    this: &Self::SyncView, // thread safe view of self
+    ctx: &TaskContext,
+    message: Self::Message) -> Self::MsgSendOutcome;
+  // this method is never called from single thread.
+  // if none then there are no messages in queue
+  fn respond_to_message(&mut self, ctx: &TaskContext) -> Option<Continuation>;
+}
+
+struct HillariousIso {
+  count: u64,
+  queue: MPSCQueue<HillariousIsoMessage>
+}
+impl HillariousIso {
+  fn shit_pants(&mut self) {
+    self.count += 1;
+  }
+  fn anounce(&self) {
+    println!("pants have been shited {} times", self.count)
+  }
+}
+enum HillariousIsoMessage {
+  ShitPants, Anounce
+}
+impl Isolate for HillariousIso {
+  type Message = HillariousIsoMessage;
+  type MsgSendOutcome = ();
+  type SyncView = Self;
+  fn respond_to_message(&mut self, ctx:&TaskContext) -> Option<Continuation> { unsafe {
+    let allocer = &mut(*(*ctx.0.get()).worker_inner_context_ref).allocator;
+    let msg = self.queue.dequeue_item(allocer);
+    match msg {
+      None => return None,
+      Some(msg) => {
+        match msg {
+          HillariousIsoMessage::Anounce => self.anounce(),
+          HillariousIsoMessage::ShitPants => self.shit_pants()
+        }
+        return Some(Continuation::Done)
+      }
+    }
+  } }
+  fn send_message(
+    this: &Self,
+    ctx: &TaskContext,
+    message: Self::Message
+  ) { unsafe {
+    let src = &mut *ctx.0.get();
+    let ptr = &mut (*src.worker_inner_context_ref).allocator;
+    this.queue.enqueue_item(message, ptr);
+  } }
+}
+
+#[test]
+fn messaging_isolate() {
+  struct Ctx {
+    iso_ref: IsolateRef<HillariousIso>,
+    counter: u32
+  }
+  fn begin(ctx: &TaskContext) -> Continuation { unsafe {
+    let frame = &mut *ctx.access_task_frame::<Ctx>();
+
+    frame.counter = 1;
+
+    let iso = ctx.spawn_isolate(HillariousIso{count: 0, queue: MPSCQueue::new()});
+    frame.iso_ref = iso;
+
+    return Continuation::Then(looper);
+  } }
+  fn looper(ctx: &TaskContext) -> Continuation {
+    let frame = unsafe {&mut *ctx.access_task_frame::<Ctx>()};
+
+    ctx.send_message(
+      &frame.iso_ref,
+      HillariousIsoMessage::ShitPants);
+
+    if frame.counter == 0 { return Continuation::Then(|ctx| {
+      let frame = unsafe {&mut *ctx.access_task_frame::<Ctx>()};
+
+      ctx.send_message(&frame.iso_ref, HillariousIsoMessage::Anounce);
+      let copy = unsafe {transmute_copy::<_, IsolateRef<HillariousIso>>(&frame.iso_ref)};
+      ctx.dispose_isolate(copy);
+
+      return Continuation::Done
+    }) }
+    frame.counter -= 1;
+    return Continuation::Then(looper)
+  }
+  let mut wg = WorkGroup::new(garbage!(Ctx), begin);
+  wg.await_completion();
+  unsafe {
+    let relc = ALLOCATION_COUNT.load(Ordering::Relaxed);
+    let acqc = DEALLOCATION_COUNT.load(Ordering::Relaxed);
+    println!("{} {}", relc, acqc);
     assert!(relc == acqc);
   }
 }
 
 #[test]
-fn work_sharing_kinda_works() {
+fn deffered_frame_installation() {
 
+  type Frame = Option<ArcBox<String>>;
+  fn begin(ctx: &TaskContext) -> Continuation { unsafe {
+    let str_ = String::from_str("quite a shiny day, eh?").unwrap();
+    ctx.install_task_frame::<Frame>();
+    let frame = ctx.access_task_frame::<Frame>();
+    let box_ = ctx.spawn_rc_box(str_);
+    frame.write(Some(box_));
+
+    return Continuation::Then(|ctx|{
+      let frame = &mut *ctx.access_task_frame::<Frame>();
+      let val = frame.take().unwrap();
+      assert!(val.as_ref() == &String::from_str("quite a shiny day, eh?").unwrap());
+      ctx.dispose_rc_box(val);
+      return Continuation::Done;
+    })
+  } }
+  let mut wg = WorkGroup::new((), begin);
+  wg.await_completion();
+  unsafe {
+    let relc = ALLOCATION_COUNT.load(Ordering::Relaxed);
+    let acqc = DEALLOCATION_COUNT.load(Ordering::Relaxed);
+    assert!(relc == acqc);
+  }
+}
+
+static mut WAS_DESTROYED: bool = false;
+struct DestructibleIso;
+impl Drop for DestructibleIso {
+  fn drop(&mut self) {
+    unsafe { WAS_DESTROYED = true }
+  }
+}
+impl Isolate for DestructibleIso {
+  type Message = ();
+  type MsgSendOutcome = ();
+  type SyncView =  Self;
+  fn respond_to_message(&mut self, ctx: &TaskContext) -> Option<Continuation> {
+    return None
+  }
+  fn send_message(
+    this: &Self::SyncView, // thread safe view of self
+    ctx: &TaskContext,
+    message: Self::Message) -> Self::MsgSendOutcome {
+
+  }
+}
+#[test]
+fn destructibe_isolate() {
+  fn fun(ctx: &TaskContext) -> Continuation {
+    let iso = ctx.spawn_isolate(DestructibleIso);
+    ctx.dispose_isolate(iso);
+    return Continuation::Done;
+  }
+  let mut wg = WorkGroup::new((), fun);
+  wg.await_completion();
+  unsafe {
+    let relc = ALLOCATION_COUNT.load(Ordering::Relaxed);
+    let acqc = DEALLOCATION_COUNT.load(Ordering::Relaxed);
+    assert!(relc == acqc);
+    assert!(WAS_DESTROYED);
+  }
+}
+
+enum AnouncerMessage {
+  Text(String), Flush
+}
+struct Anouncer {
+  items: Vec<String>,
+  queue: MPSCQueue<AnouncerMessage>,
+}
+
+impl Isolate for Anouncer {
+  type Message = AnouncerMessage;
+  type MsgSendOutcome = ();
+  type SyncView = Self;
+  fn respond_to_message(&mut self, ctx: &TaskContext) -> Option<Continuation> {
+    let sralloc =  unsafe{ &mut(*(*ctx.0.get()).worker_inner_context_ref).allocator};
+    let msg = self.queue.dequeue_item(sralloc);
+    match msg {
+      Some(msg) => {
+        match msg {
+          AnouncerMessage::Flush => println!("{}", self.items.join("; ")),
+          AnouncerMessage::Text(text) => self.items.push(text)
+        };
+        return Some(Continuation::Done)
+      },
+      None => return None
+    }
+  }
+  fn send_message(
+    this: &Self::SyncView, // thread safe view of self
+    ctx: &TaskContext,
+    message: Self::Message) -> Self::MsgSendOutcome {
+    let sralloc =  unsafe{ &mut(*(*ctx.0.get()).worker_inner_context_ref).allocator};
+    this.queue.enqueue_item(message, sralloc);
+  }
+}
+
+#[test]
+fn send_in_task_in_send() {
+  struct Ctx { iso_ref: IsolateRef<Anouncer> }
+  fn fun(ctx: &TaskContext) -> Continuation {
+    let iso = ctx.spawn_isolate(
+      Anouncer {items: Vec::new(), queue: MPSCQueue::new()});
+    for i in 0 .. 10 {
+      ctx.spawn_subtask((iso.clone(),i), |ctx|{
+        let (iso, i) = unsafe{ &mut *ctx.access_task_frame::<(IsolateRef<Anouncer>, i32)>() };
+        ctx.send_message(&iso, AnouncerMessage::Text(format!("{i}")));
+        ctx.dispose_isolate(unsafe {transmute_copy::<_, IsolateRef<Anouncer>>(iso) });
+        return Continuation::Done
+      })
+    }
+    ctx.send_message(&iso, AnouncerMessage::Flush);
+    ctx.dispose_isolate(iso);
+    return Continuation::Done;
+  }
+  let mut wg = WorkGroup::new((), fun);
+  wg.await_completion();
+  unsafe {
+    let relc = ALLOCATION_COUNT.load(Ordering::Relaxed);
+    let acqc = DEALLOCATION_COUNT.load(Ordering::Relaxed);
+    println!("{} {}", acqc, relc);
+    assert!(relc == acqc);
+  }
 }
