@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, ptr::{copy_nonoverlapping, addr_of, addr_of_mut, null_mut}, mem::{size_of, align_of}, str::FromStr};
 
-use crate::{utils::{DrainablePageHolder, ptr_align_dist}, garbage, root_alloc::{Block4KPtr, RootAllocator}};
+use crate::{utils::{PageSource, ptr_align_dist}, garbage, root_alloc::{Block4KPtr, RootAllocator}};
 
 struct NodePageHeader {
   next_page: *mut u8
@@ -41,7 +41,7 @@ impl InterlaceAllocator {
   pub fn store_item<T>(
     &mut self,
     item: T,
-    page_source: &mut dyn DrainablePageHolder
+    page_source: &mut dyn PageSource
   ) -> InterlacedSeqvItemRef<T> { unsafe {
     let mut head = self.write_head;
     *head.cast::<Tag>() = Tag::JumpSignal;
@@ -63,7 +63,7 @@ impl InterlaceAllocator {
   } }
   pub fn start_seqv<T>(
     &mut self,
-    page_source: &mut dyn DrainablePageHolder
+    page_source: &mut dyn PageSource
   ) -> SeqvWriter<T> { unsafe {
     if self.origin == null_mut() {
       let page = page_source.try_drain_page().unwrap();
@@ -121,7 +121,7 @@ impl <T> SeqvWriter<T> {
   }
   fn take_free_slot(
     &mut self,
-    page_source: &mut dyn DrainablePageHolder
+    page_source: &mut dyn PageSource
   ) -> *mut T { unsafe {
     self.count += 1;
     loop {
@@ -153,7 +153,7 @@ impl <T> SeqvWriter<T> {
       return data.cast()
     }
   }; }
-  pub fn append_item(&mut self, item: T, page_source: &mut dyn DrainablePageHolder) {
+  pub fn append_item(&mut self, item: T, page_source: &mut dyn PageSource) {
     let slot = self.take_free_slot(page_source);
     unsafe {slot.write(item)}
   }

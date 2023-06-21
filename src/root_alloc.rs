@@ -1,7 +1,7 @@
 
 use std::{alloc::{alloc, Layout}, sync::atomic::{AtomicU16, Ordering, fence}, cell::UnsafeCell, thread, ptr::{null_mut, addr_of_mut, addr_of, slice_from_raw_parts}, mem::MaybeUninit};
 
-use crate::{cast, utils::DrainablePageHolder};
+use crate::{cast, utils::PageSource};
 
 pub struct RootAllocator {
   super_page_start: UnsafeCell<*mut [u8;4096]>,
@@ -87,7 +87,7 @@ fn alloc_works() {
   }
 }
 
-impl DrainablePageHolder for RootAllocator {
+impl PageSource for RootAllocator {
   fn try_drain_page(&mut self) -> Option<Block4KPtr> {
     self.try_get_block()
   }

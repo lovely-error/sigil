@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping, addr_of, addr_of_mut}, mem::{size_of, MaybeUninit, forget}, cell::UnsafeCell};
 
-use crate::{root_alloc::{RootAllocator, Block4KPtr}, cast, utils::DrainablePageHolder};
+use crate::{root_alloc::{RootAllocator, Block4KPtr}, cast, utils::PageSource};
 
 
 // this datatype is monomorphisation-aware.
@@ -21,7 +21,7 @@ pub struct Array<T>(
   PhantomData<T>);
 
 impl <T> Array<T> {
-  pub fn new(ralloc: *mut dyn DrainablePageHolder) -> Self {
+  pub fn new(ralloc: *mut dyn PageSource) -> Self {
     Self(UnsafeCell::new(ArrayInternals::new(ralloc)), PhantomData)
   }
   pub fn ref_item_at_index(&self, index: usize) -> Option<&mut T> {
@@ -62,14 +62,14 @@ impl <T> Array<T> {
 }
 
 struct ArrayInternals {
-  mem_block_provider: *mut dyn DrainablePageHolder,
+  mem_block_provider: *mut dyn PageSource,
   head_page: *mut u8,
   tail_page: *mut u8,
   access_head: *mut u8,
   item_count: usize,
 }
 impl ArrayInternals {
-  fn new(page_provider: *mut dyn DrainablePageHolder) -> Self {
+  fn new(page_provider: *mut dyn PageSource) -> Self {
     Self { mem_block_provider: page_provider,
            head_page: null_mut(),
            tail_page: null_mut(),
@@ -286,7 +286,7 @@ fn indexing_works() {
   }
 }
 
-impl <T> DrainablePageHolder for Array<T> {
+impl <T> PageSource for Array<T> {
   fn try_drain_page(&mut self) -> Option<Block4KPtr> { unsafe {
     let ArrayInternals { access_head, tail_page, .. } = &mut *self.0.get();
     let page_start_addr = (*access_head as usize) & !((1 << 12) - 1);

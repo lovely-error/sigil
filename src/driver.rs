@@ -1,12 +1,15 @@
 
-use std::{sync::atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, compiler_fence}, mem::{size_of, MaybeUninit, forget, ManuallyDrop, transmute, align_of, transmute_copy, needs_drop}, ptr::{addr_of, null_mut, copy_nonoverlapping, addr_of_mut, drop_in_place}, thread::{JoinHandle, self, park, yield_now, Thread, current, sleep}, cell::UnsafeCell, str::FromStr, cmp::min, alloc::{alloc, Layout}, marker::PhantomData, ops::Add, time::{Duration, SystemTime}, iter::zip, collections::HashMap};
+use std::{sync::{atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, compiler_fence}, mpsc::{Receiver, channel, Sender}}, mem::{size_of, MaybeUninit, forget, ManuallyDrop, transmute, align_of, transmute_copy, needs_drop}, ptr::{addr_of, null_mut, copy_nonoverlapping, addr_of_mut, drop_in_place}, thread::{JoinHandle, self, park, yield_now, Thread, current, sleep, spawn}, cell::UnsafeCell, str::FromStr, cmp::min, alloc::{alloc, Layout}, marker::PhantomData, ops::Add, time::{Duration, SystemTime}, iter::zip, collections::HashMap, os::fd::{AsRawFd, RawFd}};
 
-use crate::{root_alloc::{RootAllocator, Block4KPtr}, utils::{ptr_align_dist, with_scoped_consume, bitcopy, high_order_pow2, DrainablePageHolder, offset_to_higher_multiple, bitcast}, cast, loopbuffer::{InlineLoopBuffer, LoopBufferTraverser}, array::Array, garbage, semi_inline_seqv::SemiInlineSeqv, mpsc::MPSCQueue,  };
+use core_affinity::CoreId;
+use polling::{Poller, Source, Event};
+
+use crate::{root_alloc::{RootAllocator, Block4KPtr}, utils::{ptr_align_dist, with_scoped_consume, bitcopy, high_order_pow2, PageSource, offset_to_higher_multiple, bitcast}, cast, loopbuffer::{InlineLoopBuffer, LoopBufferTraverser}, array::Array, garbage, semi_inline_seqv::SemiInlineSeqv, mpsc::MPSCQueue,  };
 
 extern crate core_affinity;
 
 pub struct SubRegionAllocator {
-  page_provider: *mut dyn DrainablePageHolder,
+  page_provider: *mut dyn PageSource,
   current_page_start: *mut u8,
   allocation_tail: *mut u8,
   free_list: *mut u8
@@ -17,7 +20,7 @@ static mut ALLOCATION_COUNT : AtomicU64 = AtomicU64::new(0);
 
 impl SubRegionAllocator {
   pub fn new(
-    page_provider: *mut dyn DrainablePageHolder
+    page_provider: *mut dyn PageSource
   ) -> Self {
     let mut raw = garbage!(Self);
     raw.page_provider = page_provider;
@@ -25,7 +28,7 @@ impl SubRegionAllocator {
     raw.current_page_start = null_mut();
     return raw;
   }
-  pub(crate) fn give_page_for_recycle(&mut self, Block4KPtr(ptr):Block4KPtr) { unsafe {
+  pub(crate) fn give_page_for_recycle_impl(&mut self, Block4KPtr(ptr):Block4KPtr) { unsafe {
     *ptr.cast::<*mut u8>() = self.free_list;
     self.free_list = ptr;
   } }
@@ -98,7 +101,7 @@ impl SubRegionAllocator {
     let i = (&*root.cast::<RegionMetadata>()).ref_count.fetch_sub(1, Ordering::AcqRel);
     if i == 1 {
       // this page is ours!
-      self.give_page_for_recycle(Block4KPtr(root.cast()));
+      self.give_page_for_recycle_impl(Block4KPtr(root.cast()));
     }
     // forget(ptr);
   } }
@@ -111,7 +114,7 @@ impl SubRegionAllocator {
   } }
 }
 
-impl DrainablePageHolder for SubRegionAllocator {
+impl PageSource for SubRegionAllocator {
   fn try_drain_page(&mut self) -> Option<Block4KPtr> {
       if let k@Some(_) = self.drain_spare_page() {
         return k
@@ -120,6 +123,12 @@ impl DrainablePageHolder for SubRegionAllocator {
       }
   }
 }
+impl PageSink for SubRegionAllocator {
+  fn give_page_for_recycle(&mut self, page: Block4KPtr) {
+    self.give_page_for_recycle_impl(page)
+  }
+}
+impl PageManager for SubRegionAllocator {}
 
 pub struct SubRegionRef(u64);
 impl SubRegionRef {
@@ -184,18 +193,130 @@ fn test_acks_work() { unsafe {
   }
 } }
 
+struct IOPollingWorker {
+  work_group: *mut WorkGroup,
+  handle: Option<JoinHandle<()>>,
+  out_port: Receiver<IOPollingCallbackData>,
+  core_pin_index: CoreId,
+}
+impl IOPollingWorker {
+  fn start(&mut self) {
+    if let None = self.handle {
+      let this = unsafe { transmute_copy::<_, u64>(&self) };
+      self.handle = Some(spawn(move || {
+        let this = unsafe { transmute(this) };
+        io_polling_routine(this)
+      }))
+    }
+  }
+}
+struct IOPollingCallbackData {
+  task_to_resume: Task,
+  target: RawFd,
+  readable: bool,
+  writeable: bool
+}
+fn io_polling_routine(this: &mut IOPollingWorker) { unsafe {
+  let ok = core_affinity::set_for_current(this.core_pin_index);
+  assert!(ok, "failed to pin io thread to core");
+  let mut pending_tasks = HashMap::<usize, (Task, RawFd)>::new();
+  let poller = Poller::new().unwrap();
+  let work_source = &mut this.out_port;
+  let mut wait_time = Duration::from_millis(1);
+  let mut gathered_events = Vec::new();
+  let mut batch_for_resume = Vec::new();
+  let mut id = 0usize;
+  let mut get_id = || { id = id.wrapping_add(1); return id };
+  let work_set = &(*this.work_group).worker_set;
+  loop {
+    let maybe_some_data = work_source.try_recv();
+    match maybe_some_data {
+      Ok(data) => {
+        let id = get_id();
+        pending_tasks.insert(id, (data.task_to_resume, data.target));
+        let ev = Event {
+          key: id,
+          readable: data.readable,
+          writable: data.writeable
+        };
+        poller.add(data.target, ev).unwrap();
+      },
+      Err(err) => {
+        match err {
+          std::sync::mpsc::TryRecvError::Disconnected => {
+            return
+          },
+          std::sync::mpsc::TryRecvError::Empty => {
+
+          }
+        }
+      }
+    }
+    gathered_events.clear();
+    poller.wait(&mut gathered_events, Some(Duration::from_secs(0))).unwrap();
+    let no_continuations_to_resume = gathered_events.is_empty();
+    if no_continuations_to_resume {
+      let should_stop =
+        work_set.all_workers_are_idle() &&
+        pending_tasks.is_empty() ;
+      if should_stop {
+        (*work_set.0.get()).io_worker_stopped.store(true, Ordering::Relaxed);
+        return
+      }
+      sleep(wait_time);
+      if wait_time <= Duration::from_secs(1) { wait_time *= 2 };
+      continue;
+    } else {
+      wait_time = Duration::from_millis(1)
+    }
+    for event in &gathered_events {
+      let (task, fd) = pending_tasks.remove(&event.key).unwrap();
+      poller.delete(fd).unwrap();
+      let child_count = &mut*task.frame_ptr.deref().cast::<ChildrenCountTaskMetadataView>();
+      let count = child_count.mref_internals().lock_count.fetch_sub(1, Ordering::Relaxed);
+      if count == 1 {
+        // we should resume this task
+        fence(Ordering::Acquire); // syncs thunk invocation as happened at this point
+        batch_for_resume.push(task);
+      } else {
+        // one of child tasks will awake this task
+      }
+    }
+    let no_resume_batch = batch_for_resume.is_empty();
+    if !no_resume_batch {
+      if let Some(free_worker) = (*this.work_group).worker_set.try_acquire_free_worker_mref() {
+        if !free_worker.flags.was_started() { free_worker.start() }
+        free_worker.with_synced_access(|worker| {
+          let task_set = &mut (*worker.inner_context_ptr.assume_init()).workset;
+          while let Some(task) = batch_for_resume.pop() {
+            task_set.enque(task)
+          }
+        });
+        batch_for_resume.clear();
+      }
+      continue;
+    }
+  }
+} }
+
+const ASSUMED_NUMBER_OF_CORES_ON_AVERAGE_MODERN_MACHINE : usize = 16;
 struct WorkerSet(UnsafeCell<WorkerSetData>);
 struct WorkerSetData {
-  inline_workers: [MaybeUninit<Worker>; 16],
+  inline_workers: [MaybeUninit<Worker>; ASSUMED_NUMBER_OF_CORES_ON_AVERAGE_MODERN_MACHINE],
   outline_workers: Option<Array<Worker>>,
   inline_free_indicies: AtomicU64,
   outline_free_indicies: Option<Array<AtomicU64>>,
   total_worker_count: u32,
+  io_worker_stopped: AtomicBool,
+  io_thread: IOPollingWorker // sorry :(
 }
 
 impl WorkerSet {
   fn inline_free_indicies(&self) -> &AtomicU64 {
     &unsafe { &*self.0.get() }.inline_free_indicies
+  }
+  fn io_worker_stoped(&self) -> bool {
+    unsafe { &*self.0.get() }.io_worker_stopped.load(Ordering::Relaxed)
   }
   fn total_worker_count(&self) -> u32 {
     unsafe { &*self.0.get() }.total_worker_count
@@ -261,6 +382,16 @@ impl WorkerSet {
       let val = &mut *ptr;
       return Some(val)
     }
+  } }
+  fn all_workers_are_idle(&self) -> bool { unsafe {
+    let this = &mut *self.0.get();
+    let idle = this.inline_free_indicies.load(Ordering::Relaxed) == 0;
+    if idle {
+      if let Some(_) = this.outline_free_indicies {
+        todo!()
+      }
+    }
+    return idle
   } }
 }
 
@@ -373,7 +504,8 @@ struct Worker {
   inner_context_ptr: MaybeUninit<*mut CommonWorkerInnerContext>,
   index: u32,
   flags: WorkerFlags,
-  core_id: core_affinity::CoreId
+  core_pin_id: core_affinity::CoreId,
+  io_tasks_sink: Sender<IOPollingCallbackData>
 }
 impl Worker {
   // false if already occupied
@@ -409,9 +541,9 @@ impl Worker {
       let v = g.consume();
       if let Some(thread) = v {
         let () = thread.join().unwrap();
-        g.assign(None);
+        g.recover(None);
       } else {
-        g.assign(v)
+        g.recover(v)
       };
     });
   }
@@ -439,14 +571,14 @@ impl Worker {
 // too many stale pages. We ask those objects to give away pages
 // they dont use and put them to use somewhere else.
 struct PageRerouter<const Capacity:usize> {
-  subscribed_donors: InlineLoopBuffer<Capacity, *mut dyn DrainablePageHolder>,
+  subscribed_donors: InlineLoopBuffer<Capacity, *mut dyn PageSource>,
   ralloc: *mut RootAllocator
 }
 impl <const Capacity:usize> PageRerouter<Capacity> {
   fn new(ralloc: *mut RootAllocator) -> Self {
     Self { subscribed_donors: InlineLoopBuffer::new(), ralloc }
   }
-  fn register(&mut self, new_donor: *mut dyn DrainablePageHolder) {
+  fn register(&mut self, new_donor: *mut dyn PageSource) {
     let ok = self.subscribed_donors.push_to_tail(new_donor);
     assert!(ok);
   }
@@ -466,7 +598,7 @@ impl <const Capacity:usize> PageRerouter<Capacity> {
     }
   }; }
 }
-impl <const Capacity:usize> DrainablePageHolder for PageRerouter<Capacity> {
+impl <const Capacity:usize> PageSource for PageRerouter<Capacity> {
   fn try_drain_page(&mut self) -> Option<Block4KPtr> {
       Some(self.get_page())
   }
@@ -505,8 +637,8 @@ struct WorkerInnerContext<const S0:usize, const S1:usize> {
 const TASK_CACHE_SIZE:usize = 16;
 
 fn worker_processing_routine(worker: &mut Worker) { unsafe {
-  let ok = core_affinity::set_for_current(worker.core_id);
-  assert!(ok, "failed to pin worker {} to core {:?}", worker.index, worker.core_id);
+  let ok = core_affinity::set_for_current(worker.core_pin_id);
+  assert!(ok, "failed to pin worker {} to core {:?}", worker.index, worker.core_pin_id);
   let ralloc = addr_of_mut!((&mut *worker.work_group).ralloc);
   let mut inner_context = {
     let mut ctx: CommonWorkerInnerContext = garbage!();
@@ -602,31 +734,28 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
       };
       let produced_subtasks = immidiate_state.spawned_subtask_count != 0;
       match (continuation, produced_subtasks) {
-        (Continuation::Rerun, true) => {
-          immidiate_state.current_task.action.set_fun_ptr(current_thunk);
+        (Continuation::Await(fd, r, w, next), _) => {
+          immidiate_state.current_task.action.set_fun_ptr(next);
           if immidiate_state.current_task.frame_ptr.is_null() {
             immidiate_state.current_task.frame_ptr = inner_context.allocator.sralloc(
               size_of::<ChildrenCountTaskMetadataView>(), align_of::<ChildrenCountTaskMetadataView>());
           };
+          immidiate_state.spawned_subtask_count += 1;
           (*immidiate_state.current_task.frame_ptr.deref().cast::<ChildrenCountTaskMetadataView>())
-            .mref_internals().lock_count = AtomicU64::new(immidiate_state.spawned_subtask_count);
-          *immidiate_state.slot_for_dormant_parent_task =
-            transmute_copy(&immidiate_state.current_task);
+            .mref_internals().lock_count = AtomicU64::new(
+              immidiate_state.spawned_subtask_count);
+          if produced_subtasks {
+            *immidiate_state.slot_for_dormant_parent_task =
+              transmute_copy(&immidiate_state.current_task);
+          }
+
+          let item = IOPollingCallbackData {
+            task_to_resume: transmute_copy(&immidiate_state.current_task),
+            target: fd, readable: r, writeable: w
+          };
+          worker.io_tasks_sink.send(item).unwrap();
           task_context.clear_dirty_state();
-          schedule_work(worker, workset_);
-          continue 'quantum
-        },
-        (Continuation::Rerun, false) => {
-          // this has drawbacks which seem impossible to counter.
-          // the worst case is the workset gets bubbled with tasks
-          // that get reruned waiting for system to serve their requests.
-          // this could either slow down doing usefull work or in a really bad
-          // scenario turn worker into a blocked thread.
-          // TODO: make some clever fix for this
-          immidiate_state.current_task.action.set_fun_ptr(current_thunk);
-          let copied_task : Task = transmute_copy(&immidiate_state.current_task);
-          inner_context.workset.outline_tasks.push(copied_task);
-          continue 'quantum
+          continue 'quantum;
         },
         (Continuation::Then(next_thunk), false) => {
           // task need not await its children.
@@ -838,6 +967,10 @@ struct TaskContextInternals {
 enum MsgStore {
   Immidiate([u8;15]), Indirect(*mut u8)
 }
+pub trait PageSink {
+  fn give_page_for_recycle(&mut self, page: Block4KPtr);
+}
+pub trait PageManager: PageSource + PageSink {}
 impl TaskContext {
   fn new(
     worker_inner_context: *mut CommonWorkerInnerContext,
@@ -865,7 +998,10 @@ impl TaskContext {
       return false
     }
   }; }
-
+  pub fn get_page_provider(&self) -> &mut dyn PageManager { unsafe {
+    let this = &mut *self.0.get();
+    &mut (*this.worker_inner_context_ref).allocator
+  } }
   pub fn install_task_frame<T>(&self) { unsafe {
     let this = &mut *self.0.get();
     let fptr = &mut (*this.immidiate_state).current_task.frame_ptr;
@@ -940,8 +1076,7 @@ impl TaskContext {
     let mut smth ;
     loop {
       smth = iso_meta.send_method_impl.fetch_or(
-        IsolateMetadata::OWNERSHIP_BIT |
-        IsolateMetadata::BEING_PROCESSED_BIT, Ordering::AcqRel);
+        IsolateMetadata::OWNERSHIP_BIT , Ordering::AcqRel);
       send_impl_ptr = smth & ((1 << 48) - 1);
       if send_impl_ptr == 0 { continue; }
       break;
@@ -959,49 +1094,7 @@ impl TaskContext {
     let idle = smth & IsolateMetadata::BEING_PROCESSED_BIT == 0;
     let this = &mut *self.0.get();
     if idle {
-      let resolve = transmute::<_, UniversalMsgRespondSig>(iso_meta.respond_method_impl);
-      let context_clone = transmute_copy::<_, TaskContext>(self);
-      let mut local_immidiate = ImmidiateState {
-        spawned_subtask_count: 0,
-        slot_for_dormant_parent_task: null_mut(),
-        region_ref: MaybeUninit::uninit(),
-        current_task: Task { action: Action::new_null(), frame_ptr: SubRegionRef::new_null() }
-      };
-      (*context_clone.0.get()).immidiate_state = addr_of_mut!(local_immidiate);
 
-      let outcome = resolve(iso_data.cast(), &context_clone);
-      let _ = iso_meta.send_method_impl.fetch_and(
-        !IsolateMetadata::BEING_PROCESSED_BIT, Ordering::Release);
-
-      if let Some(continuation) = outcome {
-        match continuation {
-          Continuation::Done =>
-            local_immidiate.current_task.action.set_fun_ptr(|_|{Continuation::Done}),
-          Continuation::Then(continuation) =>
-            local_immidiate.current_task.action.set_fun_ptr(continuation),
-          Continuation::Rerun => panic!("attempt to rerun the thunk which cannot be rerun")
-        };
-        let spwaned_subtasks = !local_immidiate.slot_for_dormant_parent_task.is_null();
-        if spwaned_subtasks {
-          // last child task will awake this one
-          if local_immidiate.current_task.frame_ptr.is_null() {
-            // we have to allocate minimal frame for subtaks to sync on
-            local_immidiate.current_task.frame_ptr =
-              (*this.worker_inner_context_ref).allocator.sralloc(
-                size_of::<ChildrenCountTaskMetadataView>(), align_of::<ChildrenCountTaskMetadataView>());
-          }
-          let ptr = local_immidiate.current_task.frame_ptr.deref();
-          (*ptr.cast::<ChildrenCountTaskMetadataView>()).mref_internals().lock_count =
-            AtomicU64::new(local_immidiate.spawned_subtask_count);
-          copy_nonoverlapping(
-            &local_immidiate.current_task, local_immidiate.slot_for_dormant_parent_task, 1);
-          // children will awake this task
-        } else {
-          // no subtask were spawne which would have awaken the parent.
-          // we are responsible for this task created by executing the deque operation
-          (*this.worker_inner_context_ref).workset.enque(local_immidiate.current_task);
-        }
-      }
     }
 
     let orphan = smth & IsolateMetadata::OWNERSHIP_BIT == 0;
@@ -1196,7 +1289,18 @@ impl TaskFlags {
 pub enum Continuation {
   Done,
   Then(Thunk),
-  Rerun
+  Await(RawFd, bool, bool, Thunk)
+}
+impl Continuation {
+  pub fn wait_on(
+    obj: impl Source,
+    watch_readability: bool,
+    watch_writeability:bool,
+    continuation: Thunk
+  ) -> Self {
+    let desc = obj.raw();
+    Self::Await(desc, watch_readability, watch_writeability, continuation)
+  }
 }
 type Thunk = fn (&TaskContext) -> Continuation;
 struct Action(UnsafeCell<ActionInternals>);
@@ -1253,12 +1357,14 @@ struct Task {
   action: Action,
   frame_ptr: SubRegionRef
 }
+struct FramePtr(SubRegionRef);
+impl FramePtr {
+
+}
 
 pub struct WorkGroup {
   ralloc: RootAllocator,
   worker_set: WorkerSet,
-  completion_awaiting_thread: MaybeUninit<Thread>,
-  sigkill: AtomicU8
 }
 
 impl WorkGroup {
@@ -1266,13 +1372,22 @@ impl WorkGroup {
     let core_ids = core_affinity::get_core_ids().unwrap_or_else(||{
       panic!("cannot retrieve core indicies")
     });
-    let thread_count = core_ids.len();
-    if thread_count > 64 {
+    let total_core_count = core_ids.len();
+    if total_core_count > 64 {
       panic!("fixme: write impls for some stuff here and there")
     }
+    let (worker_count, io_core_pin) = {
+      let last = core_ids.last().unwrap().clone();
+      if total_core_count == 1 { (total_core_count, last) }
+      else {
+        let count = total_core_count - 1;
+        (count, last)
+      }
+    };
     let boxed = alloc(
       Layout::from_size_align_unchecked(size_of::<Self>(), align_of::<Self>()));
     let boxed = boxed.cast::<Self>();
+    let (send, recv) = channel();
     boxed.write(WorkGroup {
       ralloc:RootAllocator::new(),
       worker_set: WorkerSet(UnsafeCell::new(WorkerSetData {
@@ -1280,26 +1395,31 @@ impl WorkGroup {
         outline_workers: None,
         inline_free_indicies: AtomicU64::new(0),
         outline_free_indicies: None,
-        total_worker_count: thread_count as u32,
+        total_worker_count: worker_count as u32,
+        io_thread: IOPollingWorker {
+          work_group: boxed,
+          handle: None,
+          out_port: recv,
+          core_pin_index: io_core_pin,
+        },
+        io_worker_stopped: AtomicBool::new(false)
       })),
-      completion_awaiting_thread: MaybeUninit::uninit(),
-      sigkill: AtomicU8::new(0)
     });
-    let boxed_ = boxed;
-    let items = zip(0.., core_ids);
-    for (ix, cid) in items {
-      let wref = (*boxed_).worker_set.mref_worker_at_index(ix);
+    for wix in 0 .. worker_count as u32 {
+      let wref = (*boxed).worker_set.mref_worker_at_index(wix);
+      let pin = core_ids.get(wix as usize).unwrap().clone();
       let worker = Worker {
-        index: ix,
+        index: wix,
         runner_handle: None,
-        work_group: boxed_,
+        work_group: boxed,
         flags: WorkerFlags::new(),
         inner_context_ptr: MaybeUninit::uninit(),
-        core_id: cid
+        core_pin_id: pin,
+        io_tasks_sink: send.clone()
       };
       cast!(wref, *mut Worker).write(worker);
     }
-    let initiator = (*boxed_).worker_set.mref_worker_at_index(0);
+    let initiator = (*boxed).worker_set.mref_worker_at_index(0);
     initiator.start();
     initiator.with_synced_access(|worker|{
       let ctx = &mut *worker.inner_context_ptr.assume_init();
@@ -1324,28 +1444,32 @@ impl WorkGroup {
       ctx.workset.enque(initial_task);
     });
     let boxed = Box::from_raw(boxed);
+    (*boxed.worker_set.0.get()).io_thread.start();
     return boxed
   } }
   pub fn await_completion(&mut self) { unsafe {
-    let wsd = &mut(*self.worker_set.0.get());
+    let work_set = &mut(self.worker_set);
     loop {
-      let ixs = wsd.inline_free_indicies.load(Ordering::Relaxed);
-      if ixs == 0 {
-        if let Some(_) = wsd.outline_workers {
-          todo!()
-        };
+      if work_set.all_workers_are_idle() && work_set.io_worker_stoped() {
         break
       }
       yield_now()
     }
-    let worker_set = addr_of_mut!(self.worker_set);
-    let total_worker_count = wsd.total_worker_count;
+    let total_worker_count = work_set.total_worker_count();
     for ix in 0 .. total_worker_count {
-      let wref = (*worker_set).mref_worker_at_index(ix);
+      let wref = work_set.mref_worker_at_index(ix);
       wref.flags.mark_for_termination();
       wref.wakeup();
       wref.terminate();
     }
+    let io_worker_handle = &mut(*work_set.0.get()).io_thread.handle;
+    with_scoped_consume(io_worker_handle, |proxy|{
+      let handle = proxy.consume();
+      if let Some(thread) = handle {
+        thread.join().unwrap();
+      }
+      proxy.recover(None);
+    });
   } }
 }
 

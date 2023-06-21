@@ -1,6 +1,7 @@
 #![feature(portable_simd)]
 #![feature(exact_size_is_empty)]
 #![feature(absolute_path)]
+#![feature(trait_upcasting)]
 
 mod root_alloc;
 mod utils;
@@ -11,17 +12,22 @@ mod stable_map;
 
 mod semi_inline_seqv;
 
-mod loomed_q;
+mod sema;
 
 mod coordinated_killing;
 
 mod mpsc;
 
-mod parser;
+mod lexer;
 
 mod cli;
 
+mod parser;
+
 mod interlacing_alloc;
+
+mod reductor;
+
 
 fn main() {
   cli::main()

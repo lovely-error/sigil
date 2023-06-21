@@ -1,4 +1,4 @@
-use std::{iter::zip, mem::{align_of, size_of, MaybeUninit, transmute, ManuallyDrop}, ptr::{drop_in_place, copy_nonoverlapping, addr_of, null_mut}, cell::UnsafeCell, str::FromStr, time::{SystemTime, Duration}, alloc::{alloc, Layout}, sync::Arc};
+use std::{iter::zip, mem::{align_of, size_of, MaybeUninit, transmute, ManuallyDrop}, ptr::{drop_in_place, copy_nonoverlapping, addr_of, null_mut}, cell::UnsafeCell, str::FromStr, time::{SystemTime, Duration}, alloc::{alloc, Layout}, sync::Arc, any::Any};
 
 use crate::root_alloc::Block4KPtr;
 
@@ -103,7 +103,7 @@ impl <T> RestoreGuard<T> {
     this.1 = true;
     return value;
   } }
-  pub fn assign(&self, new_value: T) { unsafe {
+  pub fn recover(&self, new_value: T) { unsafe {
     let this = &mut *self.0.get();
     if !this.1 { drop_in_place(this.0) }
     this.0.write(new_value);
@@ -128,7 +128,7 @@ fn quick_sanity_check(){
   with_scoped_consume(&mut val.0, |val|{
     let v = val.consume();
     assert!(v == String::from_str(str).unwrap());
-    val.assign(String::from_str("yeah..").unwrap());
+    val.recover(String::from_str("yeah..").unwrap());
   });
   assert!(val.0 == String::from_str("yeah..").unwrap())
 }
@@ -172,13 +172,13 @@ pub unsafe fn bitcopy<T>(val: &T) -> T {
 // }
 
 
-pub trait DrainablePageHolder {
+pub trait PageSource {
   fn try_drain_page(&mut self) -> Option<Block4KPtr>;
 }
 
 #[test]
 fn fat_ptr_to_object() {
-  let size = size_of::<*mut dyn DrainablePageHolder>();
+  let size = size_of::<*mut dyn PageSource>();
   assert!(size == 16)
   // println!("{}", size)
 }
@@ -258,3 +258,5 @@ trait ExposesTraversableContiguosMemory {
   type Item;
   fn next_contiguos_block(&mut self) -> Option<&mut [Self::Item]>;
 }
+
+pub trait SomeDebug: Any + std::fmt::Debug + Clone {}

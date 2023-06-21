@@ -1,6 +1,6 @@
 use std::{cell::UnsafeCell, marker::PhantomData, ptr::{addr_of_mut, addr_of}, mem::forget};
 
-use crate::{loopbuffer::InlineLoopBuffer, array::Array, utils::DrainablePageHolder};
+use crate::{loopbuffer::InlineLoopBuffer, array::Array, utils::PageSource};
 
 
 pub struct SemiInlineSeqv<const InlineCapactity: usize, T>(
@@ -13,7 +13,7 @@ struct Internals<const InlineCapactity: usize, T> {
 }
 
 impl <const InlineCapactity: usize, T> SemiInlineSeqv<InlineCapactity, T> {
-  pub fn new(page_source: *mut dyn DrainablePageHolder) -> Self {
+  pub fn new(page_source: *mut dyn PageSource) -> Self {
     Self(UnsafeCell::new(
       Internals {
         inlines: InlineLoopBuffer::new(),
@@ -55,7 +55,7 @@ struct SemiInlineSeqvTraverser<'i, T> {
   related_object: &'i dyn SomeSemiInlineSeqv<T>
 }
 
-impl <const S:usize, T> DrainablePageHolder for SemiInlineSeqv<S, T> {
+impl <const S:usize, T> PageSource for SemiInlineSeqv<S, T> {
   fn try_drain_page(&mut self) -> Option<crate::root_alloc::Block4KPtr> { unsafe {
     let this = &mut *self.0.get();
     this.outlines.try_drain_page()

@@ -1,10 +1,10 @@
 
 use std::{sync::atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, compiler_fence}, mem::{size_of, MaybeUninit, forget, ManuallyDrop, transmute, align_of, transmute_copy}, ptr::{addr_of, null_mut, copy_nonoverlapping, addr_of_mut, drop_in_place}, thread::{JoinHandle, self, park, yield_now, Thread, current, sleep}, cell::UnsafeCell, str::FromStr, cmp::min, alloc::{alloc, Layout}, marker::PhantomData, ops::Add, time::{Duration, SystemTime}, iter::zip};
 
-use crate::{root_alloc::{RootAllocator, Block4KPtr}, utils::{ptr_align_dist, with_scoped_consume, bitcopy, high_order_pow2, DrainablePageHolder, offset_to_higher_multiple, bitcast}, cast, loopbuffer::{InlineLoopBuffer, LoopBufferTraverser}, array::Array, garbage, semi_inline_seqv::SemiInlineSeqv, driver::SubRegionAllocator,  };
+use crate::{root_alloc::{RootAllocator, Block4KPtr}, utils::{ptr_align_dist, with_scoped_consume, bitcopy, high_order_pow2, PageSource, offset_to_higher_multiple, bitcast}, cast, loopbuffer::{InlineLoopBuffer, LoopBufferTraverser}, array::Array, garbage, semi_inline_seqv::SemiInlineSeqv, driver::{SubRegionAllocator, PageManager},  };
 
 pub struct MPSCQueue<T> {
-  internals: MPMCQueueImpl,
+  internals: MPSCQueueImpl,
   __:PhantomData<T>
 }
 unsafe impl <T> Sync for MPSCQueue<T> {}
@@ -13,16 +13,16 @@ impl <T> MPSCQueue<T> {
   pub fn new() -> Self {
     return Self{
       __:PhantomData,
-      internals: MPMCQueueImpl::new()
+      internals: MPSCQueueImpl::new()
     };
   }
-  pub fn enqueue_item(&self, item:T, page_sourse: &mut dyn DrainablePageHolder) { unsafe {
+  pub fn enqueue_item(&self, item:T, page_sourse: &mut dyn PageSource) { unsafe {
     self.internals.enqueue_item_impl(
       addr_of!(item).cast::<u8>(),
       size_of::<T>() as u32, align_of::<T>() as u8, transmute_copy(&page_sourse));
     forget(item);
   } }
-  pub fn dequeue_item(&self, page_store: &mut SubRegionAllocator) -> Option<T> {
+  pub fn dequeue_item<'i, 'k>(&self, page_store: &mut dyn PageManager) -> Option<T> {
     let mut val = garbage!(T);
     let mut success = false;
     self.internals.dequeue_item_impl(
@@ -34,7 +34,7 @@ impl <T> MPSCQueue<T> {
     return None
   }
 }
-pub(crate) struct MPMCQueueImpl {
+struct MPSCQueueImpl {
   write_head: (AtomicU32, AtomicU32),
   read_head: AtomicU64,
 }
@@ -45,7 +45,7 @@ struct MessageQueuePageHeaderCombined(AtomicU64);
 #[repr(align(8))]
 struct MessageQueuePageHeaderSplitNonatomic(u16,u16,u32);
 
-impl MPMCQueueImpl {
+impl MPSCQueueImpl {
   pub(crate) fn new() -> Self { unsafe {
     let mut new = MaybeUninit::<Self>::uninit();
     addr_of_mut!(new).cast::<u8>().write_bytes(0, size_of::<Self>());
@@ -57,7 +57,7 @@ impl MPMCQueueImpl {
     msg_ptr: *const u8,
     msg_byte_stride: u32,
     msg_align: u8,
-    page_source: *mut dyn DrainablePageHolder
+    page_source: *mut dyn PageSource
   ) { unsafe {
     let addr_split = addr_of!(self.write_head);
     let addr_single = addr_split.cast::<AtomicU64>();
@@ -150,7 +150,7 @@ impl MPMCQueueImpl {
     &self,
     msg_align: usize,
     msg_byte_stride: usize,
-    sralloc: *mut SubRegionAllocator,
+    page_man: &mut dyn PageManager,
     write_back: *mut u8,
     did_return_value: &mut bool
   ) { unsafe {
@@ -183,7 +183,7 @@ impl MPMCQueueImpl {
                 continue 'inner;
               },
               Ok(_) => {
-                (*sralloc).give_page_for_recycle(Block4KPtr(rh as _));
+                (*page_man).give_page_for_recycle(Block4KPtr(rh as _));
                 continue 'page;
               }
             }
@@ -215,13 +215,11 @@ impl MPMCQueueImpl {
   }; }
 }
 
-unsafe impl Sync for MPMCQueueImpl {}
+unsafe impl Sync for MPSCQueueImpl {}
 
-#[repr(align(8))]
-struct MQU(u32, u32);
 #[test]
 fn single_store() { unsafe {
-  assert!(align_of::<MPMCQueueImpl>() == 8);
+  assert!(align_of::<MPSCQueueImpl>() == 8);
   let mut a = (u32::MAX, 0u32);
   let ptr = addr_of_mut!(a).cast::<u32>();
   assert!(*ptr == u32::MAX && *ptr.add(1) == 0);
@@ -230,7 +228,7 @@ fn single_store() { unsafe {
 } }
 
 struct TestPageAlloc;
-impl DrainablePageHolder for TestPageAlloc {
+impl PageSource for TestPageAlloc {
   fn try_drain_page(&mut self) -> Option<Block4KPtr> {
     let mem = unsafe { alloc(Layout::from_size_align_unchecked(4096, 4096)) };
     return Some(Block4KPtr(mem))
