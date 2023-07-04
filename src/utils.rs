@@ -103,7 +103,7 @@ impl <T> RestoreGuard<T> {
     this.1 = true;
     return value;
   } }
-  pub fn recover(&self, new_value: T) { unsafe {
+  pub fn recover_with(&self, new_value: T) { unsafe {
     let this = &mut *self.0.get();
     if !this.1 { drop_in_place(this.0) }
     this.0.write(new_value);
@@ -128,7 +128,7 @@ fn quick_sanity_check(){
   with_scoped_consume(&mut val.0, |val|{
     let v = val.consume();
     assert!(v == String::from_str(str).unwrap());
-    val.recover(String::from_str("yeah..").unwrap());
+    val.recover_with(String::from_str("yeah..").unwrap());
   });
   assert!(val.0 == String::from_str("yeah..").unwrap())
 }
@@ -153,10 +153,7 @@ macro_rules! garbage {
 
 
 pub unsafe fn bitcopy<T>(val: &T) -> T {
-  let mut interm = MaybeUninit::<T>::uninit();
-  let source = cast!(val, *const T);
-  copy_nonoverlapping(source, interm.as_mut_ptr(), 1);
-  return interm.assume_init()
+  transmute::<_, *const T>(val).read()
 }
 
 
@@ -260,3 +257,5 @@ trait ExposesTraversableContiguosMemory {
 }
 
 pub trait SomeDebug: Any + std::fmt::Debug + Clone {}
+type __ = Box<dyn SomeDebug>;
+
