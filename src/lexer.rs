@@ -5,63 +5,65 @@ use regex::{RegexSet, Regex};
 
 use crate::{garbage, utils::{aligned_for, offset_to_higher_multiple, PageSource}, root_alloc::{Block4KPtr, RootAllocator}, interlacing_alloc::{InterlaceAllocator, SeqvRef, InterlacedSeqvItemRef, SeqvReader}, parser::resolve_precendece};
 
-enum Letters {}
+pub enum Letters {}
 impl Letters {
-  const A : u8 = 'A' as u8;
-  const Z : u8 = 'Z' as u8;
-  const a : u8 = 'a' as u8;
-  const z : u8 = 'z' as u8;
-  const Underscore : u8 = '_' as u8;
-  const Whitespace: u8 = ' ' as u8;
-  const NewLine: u8 = '\n' as u8;
-  const LParen: u8 = '(' as u8;
-  const RParen: u8 = ')' as u8;
-  const EOT: u8 = '\u{3}' as u8;
-  const ARROW: u16 = '-' as u16 | (('>' as u16) << 8);
-  const COLON: u8 = ':' as u8;
-  const LBrace: u8 = '{' as u8;
-  const RBrace : u8 = '}' as u8;
-  const Comma: u8 = ',' as u8;
-  const FatArrow : u16 = '=' as u16 | (('>' as u16) << 8);
-  const STAR: u8 =  '*' as u8;
-  const EQUALS: u8 = '=' as u8;
-  const OR : u16 = 'o' as u16 | (('r' as u16) << 8);
-  const AND : u32 = 'a' as u32 | (('n' as u32) << 8) | (('d' as u32) << 16);
-  const TILDA: u8 = '~' as u8;
-  const QMARK: u8 = '!' as u8;
+  pub const A : u8 = 'A' as u8;
+  pub const Z : u8 = 'Z' as u8;
+  pub const a : u8 = 'a' as u8;
+  pub const z : u8 = 'z' as u8;
+  pub const Underscore : u8 = '_' as u8;
+  pub const Whitespace: u8 = ' ' as u8;
+  pub const NewLine: u8 = '\n' as u8;
+  pub const LParen: u8 = '(' as u8;
+  pub const RParen: u8 = ')' as u8;
+  pub const EOT: u8 = '\u{3}' as u8;
+  pub const ARROW: u16 = '-' as u16 | (('>' as u16) << 8);
+  pub const COLON: u8 = ':' as u8;
+  pub const LBrace: u8 = '{' as u8;
+  pub const RBrace : u8 = '}' as u8;
+  pub const Comma: u8 = ',' as u8;
+  pub const FatArrow : u16 = '=' as u16 | (('>' as u16) << 8);
+  pub const STAR: u8 =  '*' as u8;
+  pub const EQUALS: u8 = '=' as u8;
+  pub const OR : u16 = 'o' as u16 | (('r' as u16) << 8);
+  pub const AND : u32 = 'a' as u32 | (('n' as u32) << 8) | (('d' as u32) << 16);
+  pub const TILDA: u8 = '~' as u8;
+  pub const EMARK: u8 = '!' as u8;
+  pub const SEMICOLON : u8 = ';' as u8;
 }
 
 
 #[derive(Clone, Copy)]
 struct ParseState {
   current_char_ptr:*const u8,
-  line:u32,
   decl_end: *const u8
 }
 pub struct SourceTextParser<'i> {
-  pub chars: &'i String,
+  pub chars: &'i [u8],
   state:ParseState,
-  end_ptr: *const u8,
+
 }
 #[derive(Debug, Clone, Copy)]
 enum InfixOp { Arrow, And, Or, Tilda }
 
 #[derive(Debug)]
 pub struct ParseFailure;
-pub type Maybe<T> = Result<T, Box<dyn Any>>;
+pub type Maybe<T> = Result<T, ParseFailure>;
 impl <'i> SourceTextParser<'i> {
   pub fn new(
-    chars: &'i String
+    chars: &'i [u8]
   ) -> Self {
-    let start_ptr = chars.as_ptr();
-    let end_ptr = unsafe{start_ptr.add(chars.len())};
+    let len = chars.len();
+    if len % size_of::<u8x4>() != 0 {
+      panic!("unpadded data")
+    }
+    let start = chars.as_ptr();
+    let end = unsafe{start.add(len)};
     Self {
-      chars,
-      end_ptr,
+      chars:chars,
       state:ParseState {
-        line: 1,
-        current_char_ptr: start_ptr,
-        decl_end: end_ptr
+        current_char_ptr: start,
+        decl_end: end
       },
     }
   }
@@ -81,17 +83,17 @@ impl <'i> SourceTextParser<'i> {
     unsafe {self.state.current_char_ptr =
      self.state.current_char_ptr.add(count as usize)}
   }
-  fn skip_delimiters(&mut self) { unsafe {
+  fn skip_trivia(&mut self) { unsafe {
     let delimiters = u8x4::from_array([
       Letters::Whitespace, Letters::NewLine, 0, 0
     ]);
     let end_ptr = self.state.decl_end;
     let mut char_ptr = self.state.current_char_ptr;
     loop {
-      if char_ptr >= end_ptr { return }
+      if char_ptr >= end_ptr { break; }
       let char = *char_ptr;
       let mask = u8x4::splat(char).simd_eq(delimiters);
-      if mask == Mask::splat(false) { break }
+      if !mask.any() { break }
       char_ptr = char_ptr.add(1);
     }
     self.state.current_char_ptr = char_ptr;
@@ -238,7 +240,7 @@ impl <'i> SourceTextParser<'i> {
   ) -> Maybe<RawPExpr> {
     let mut items = Vec::new();
     loop {
-      self.skip_delimiters();
+      self.skip_trivia();
       match self.current_char() {
         Letters::Underscore => {
           self.skip(1);
@@ -256,22 +258,22 @@ impl <'i> SourceTextParser<'i> {
           }
           self.skip(1);
           let expr1 = self.parse_pattern_expr()?;
-          self.skip_delimiters();
+          self.skip_trivia();
           let char = self.current_char();
           if char == Letters::Comma {
             self.skip(1);
-            self.skip_delimiters();
+            self.skip_trivia();
             let expr2 = self.parse_pattern_expr()?;
-            self.skip_delimiters();
+            self.skip_trivia();
             if self.current_char() != Letters::RParen {
-              return Err(Box::new(ParseFailure))
+              return Err(ParseFailure)
             }
             self.skip(1);
             items.push(RawPExpr::Tuple(Box::new(expr1), Box::new(expr2)));
             continue;
           }
           if char != Letters::RParen {
-            return Err(Box::new(ParseFailure))
+            return Err(ParseFailure)
           }
           self.skip(1);
           items.push(expr1);
@@ -294,7 +296,7 @@ impl <'i> SourceTextParser<'i> {
         }
       }
     }
-    if items.is_empty() { return Err(Box::new(ParseFailure)) }
+    if items.is_empty() { return Err(ParseFailure) }
     return Ok(RawPExpr::Seqv(items))
   }
   fn parse_lambda(&mut self) -> Maybe<Lambda> {
@@ -302,14 +304,14 @@ impl <'i> SourceTextParser<'i> {
     self.skip(1);
     let mut clauses = Vec::new();
     loop {
-      self.skip_delimiters();
+      self.skip_trivia();
       let clause = self.parse_clause()?;
       clauses.push(clause);
-      self.skip_delimiters();
+      self.skip_trivia();
       let char = self.current_char();
       if char == Letters::RBrace { break }
       if char == Letters::Comma { self.skip(1); continue }
-      return Err(Box::new(ParseFailure))
+      return Err(ParseFailure)
     }
     self.skip(1);
     return Ok(Lambda(clauses))
@@ -319,19 +321,18 @@ impl <'i> SourceTextParser<'i> {
     loop {
       if let Ok(pexpr) = self.parse_pattern_expr() {
         decons.push(pexpr);
-        self.skip_delimiters();
+        self.skip_trivia();
         if self.current_char() == Letters::Comma {
-          self.skip(1); self.skip_delimiters();  continue;
+          self.skip(1); self.skip_trivia();  continue;
         }
         if unsafe {transmute::<_, u16>(*self.state.current_char_ptr.cast::<[u8;2]>())}
           != Letters::FatArrow {
-            return Err(Box::new(ParseFailure))
+            return Err(ParseFailure)
         }
         self.skip(2);
-        let depth = self.probe_depth();
-        let rhs = self.parse_expr(depth)?;
+        let rhs = self.parse_expr()?;
         return Ok(Clause(decons, rhs))
-      } else { return Err(Box::new(ParseFailure)) }
+      } else { return Err(ParseFailure) }
     }
   }
   fn parse_lift(
@@ -341,14 +342,13 @@ impl <'i> SourceTextParser<'i> {
     self.skip(1);
     let binder ;
     if let Ok(b) = self.parse_pattern_expr() { binder = b } else {
-      return Err(Box::new(ParseFailure))
+      return Err(ParseFailure)
     };
-    self.skip_delimiters();
-    if self.current_char() != Letters::COLON { return Err(Box::new(ParseFailure)) }
+    self.skip_trivia();
+    if self.current_char() != Letters::COLON { return Err(ParseFailure) }
     self.skip(1);
-    let depth = self.probe_depth();
-    let expr = self.parse_expr(depth)?;
-    if self.current_char() != Letters::RParen { return Err(Box::new(ParseFailure)) }
+    let expr = self.parse_expr()?;
+    if self.current_char() != Letters::RParen { return Err(ParseFailure) }
     self.skip(1);
     return Ok(Lift(binder, expr))
   }
@@ -356,13 +356,13 @@ impl <'i> SourceTextParser<'i> {
     let chkpt = self.checkpoint();
     assert!(self.current_char() == Letters::LParen);
     self.skip(1);
-    self.skip_delimiters();
+    self.skip_trivia();
     if self.current_char() != Letters::Comma {
       self.backtrack(chkpt);
       return false
     }
     self.skip(1);
-    self.skip_delimiters();
+    self.skip_trivia();
     if self.current_char() != Letters::RParen {
       self.backtrack(chkpt);
       return false
@@ -373,8 +373,8 @@ impl <'i> SourceTextParser<'i> {
   fn next_is_unit(&mut self) -> bool {
     let chkpt = self.checkpoint();
     assert!(self.current_char() == Letters::LParen);
+    self.skip_trivia();
     self.skip(1);
-    self.skip_delimiters();
     if self.current_char() != Letters::RParen {
       self.backtrack(chkpt);
       return false
@@ -384,11 +384,10 @@ impl <'i> SourceTextParser<'i> {
   }
   fn parse_expr(
     &mut self,
-    anchor_depth: u32,
   ) -> Maybe<RawTExpr> {
     let mut components = Vec::new();
     loop {
-      self.skip_delimiters();
+      self.skip_trivia();
       let chkpt = self.checkpoint();
       if let Ok(let_) = self.parse_let() {
         components.push(RawTExpr::Let(Box::new(let_)));
@@ -419,11 +418,11 @@ impl <'i> SourceTextParser<'i> {
             continue;
           }
           self.skip(1);
-          let subexpr = self.parse_expr(anchor_depth)?;
+          let subexpr = self.parse_expr()?;
           components.push(subexpr);
-          self.skip_delimiters();
+          self.skip_trivia();
           if self.current_char() != Letters::RParen {
-            return Err(Box::new(ParseFailure))
+            return Err(ParseFailure)
           }
           self.skip(1);
           continue;
@@ -431,12 +430,12 @@ impl <'i> SourceTextParser<'i> {
         Letters::LBrace => {
           let lambda = self.parse_lambda()?;
           components.push(RawTExpr::Lambda(lambda));
-          self.skip_delimiters();
+          self.skip_trivia();
           continue;
         },
-        Letters::QMARK => {
+        Letters::EMARK => {
           self.skip(1);
-          components.push(RawTExpr::QMark);
+          components.push(RawTExpr::EMark);
           continue;
         }
         _ => {
@@ -463,24 +462,22 @@ impl <'i> SourceTextParser<'i> {
         }
       }
     }
-    if components.is_empty() { return Err(Box::new(ParseFailure)) }
+    if components.is_empty() { return Err(ParseFailure) }
     return Ok(RawTExpr::Tokens(components))
   }
   fn parse_tuple(&mut self) -> Maybe<RawTExpr> {
     assert!(self.current_char() == Letters::LParen);
     self.skip(1);
-    let depth = self.probe_depth();
-    let expr1 = self.parse_expr(depth)?;
-    self.skip_delimiters();
+    let expr1 = self.parse_expr()?;
+    self.skip_trivia();
     if self.current_char() != Letters::Comma {
-      return Err(Box::new(ParseFailure))
+      return Err(ParseFailure)
     }
     self.skip(1);
-    let depth = self.probe_depth();
-    let expr2 = self.parse_expr(depth)?;
-    self.skip_delimiters();
+    let expr2 = self.parse_expr()?;
+    self.skip_trivia();
     if self.current_char() != Letters::RParen {
-      return Err(Box::new(ParseFailure))
+      return Err(ParseFailure)
     }
     self.skip(1);
     return Ok(RawTExpr::Tuple(Box::new(expr1), Box::new(expr2)))
@@ -488,54 +485,51 @@ impl <'i> SourceTextParser<'i> {
   fn parse_let(&mut self) -> Maybe<LetGroup> {
     let mut defs = Vec::new();
     loop {
-      self.skip_delimiters();
+      self.skip_trivia();
       let pexpr = self.parse_pattern_expr()?;
-      self.skip_delimiters();
-      if self.current_char() != Letters::EQUALS { return Err(Box::new(ParseFailure)) }
+      self.skip_trivia();
+      if self.current_char() != Letters::COLON { return Err(ParseFailure) }
       self.skip(1);
-      let depth = self.probe_depth();
-      let oexpr = self.parse_expr(depth)?;
-      defs.push((pexpr, oexpr));
-      self.skip_delimiters();
+      let texpr = self.parse_expr()?;
+      if self.current_char() != Letters::EQUALS { return Err(ParseFailure) }
+      self.skip(1);
+      let oexpr = self.parse_expr()?;
+      defs.push((pexpr, texpr, oexpr));
+      self.skip_trivia();
       if self.current_char() == Letters::Comma { self.skip(1); continue }
       if unsafe{*self.state.current_char_ptr.cast::<[u8;2]>()} == ['=' as u8, '>' as u8] {
         self.skip(2); break;
       };
-      return Err(Box::new(ParseFailure))
+      return Err(ParseFailure)
     };
-    let depth = self.probe_depth();
-    let tail_expr = self.parse_expr(depth, )?;
+    let tail_expr = self.parse_expr()?;
     return Ok(LetGroup(defs, tail_expr))
   }
   fn traversed_all_chars(&self) -> bool {
-    self.state.current_char_ptr >= self.end_ptr
+    self.current_char() == Letters::EOT
   }
   pub fn parse_top_level_decl(&mut self) -> Maybe<RawDecl> {
-    let anchor_depth = self.probe_depth();
     if let Some(name) = self.parse_identifier() {
-      self.skip_delimiters();
-      if self.current_char() != Letters::COLON { return Err(Box::new(ParseFailure)) }
+      self.skip_trivia();
+      if self.current_char() != Letters::COLON { return Err(ParseFailure) }
       self.skip(1);
-      let depth = self.probe_depth().max(anchor_depth);
-      let texpr = self.parse_expr(depth)?;
-      self.skip_delimiters();
-      if self.current_char() != Letters::EQUALS { return Err(Box::new(ParseFailure)) }
+      let texpr = self.parse_expr()?;
+      self.skip_trivia();
+      if self.current_char() != Letters::EQUALS { return Err(ParseFailure) }
       self.skip(1);
-      let depth = self.probe_depth().max(anchor_depth);
-      let oexpr = self.parse_expr(depth)?;
+      let oexpr = self.parse_expr()?;
       return Ok(RawDecl(name, texpr, oexpr))
-    } else { return Err(Box::new(ParseFailure)) }
-  }
-  pub fn find_decl_boundry(&mut self) -> (u32, u32) {
-    let start_ptr = self.state.current_char_ptr;
-    let end_ptr = self.state.decl_end;
-
-    todo!()
+    } else { return Err(ParseFailure) }
   }
   pub fn parse_to_end(&mut self) -> Maybe<Vec<RawDecl>> {
     let mut items = Vec::new();
     loop {
+      self.skip_trivia();
       if self.traversed_all_chars() { break }
+      if self.current_char() == Letters::SEMICOLON {
+        self.skip(1);
+        self.skip_trivia();
+      }
       match self.parse_top_level_decl() {
         Ok(decl) => items.push(decl),
         Err(err) => return Err(err)
@@ -553,7 +547,7 @@ pub struct RawDecl(pub CharsData, pub RawTExpr, pub RawTExpr);
 #[derive(Debug)]
 pub struct Lift(pub RawPExpr, pub RawTExpr);
 #[derive(Debug)]
-pub struct LetGroup(pub Vec<(RawPExpr, RawTExpr)>, pub RawTExpr);
+pub struct LetGroup(pub Vec<(RawPExpr, RawTExpr, RawTExpr)>, pub RawTExpr);
 #[derive(Debug)]
 pub struct Lambda(pub Vec<Clause>);
 #[derive(Debug)]
@@ -561,8 +555,13 @@ pub struct Clause(pub Vec<RawPExpr>, pub RawTExpr);
 
 #[derive(Clone, Debug)]
 pub enum RawPExpr {
-  Discard, Chars(CharsData), Seqv(Vec<RawPExpr>),
-  Arrow, Tilda, Or, And,
+  Discard,
+  Chars(CharsData),
+  Seqv(Vec<RawPExpr>),
+  Arrow,
+  Tilda,
+  Or,
+  And,
   Tuple(Box<Self>, Box<Self>),
   HeadTuple,
   Pt
@@ -588,8 +587,13 @@ pub enum RawTExpr {
   Lambda(Lambda),
   Tuple(Box<Self>, Box<Self>),
   TupleCtor,
-  Arrow, Tilda, Star, Or, And,
-  Pt, QMark
+  Arrow,
+  Tilda,
+  Star,
+  Or,
+  And,
+  Pt,
+  EMark
 }
 
 fn render_raw_texpr(texpr: &RawTExpr, chars_ptr: *const u8, write_target: &mut String) {
@@ -644,9 +648,11 @@ fn render_raw_texpr(texpr: &RawTExpr, chars_ptr: *const u8, write_target: &mut S
     },
     RawTExpr::Let(let_) => {
       let LetGroup(lhs, rhs) = let_.as_ref();
-      for (bind, val) in lhs {
+      for (bind, texpr, val) in lhs {
         render_raw_pexpr(bind, chars_ptr, write_target);
-        write_target.push_str("=");
+        write_target.push_str(" : ");
+        render_raw_texpr(texpr, chars_ptr, write_target);
+        write_target.push_str(" = ");
         render_raw_texpr(val, chars_ptr, write_target);
         write_target.push(',')
       }
@@ -666,7 +672,7 @@ fn render_raw_texpr(texpr: &RawTExpr, chars_ptr: *const u8, write_target: &mut S
       write_target.push_str("}")
     },
     RawTExpr::Pt => write_target.push_str("()"),
-    RawTExpr::QMark => write_target.push('!')
+    RawTExpr::EMark => write_target.push('!')
   }
 }
 fn render_raw_pexpr(pexpr: &RawPExpr, chars_ptr: *const u8, write_target: &mut String) {
@@ -721,8 +727,8 @@ fn letter_distance() {
 fn ident_parser() {
   let s = " \nazZ_Z_ZZ_:a_Z_A_z__";
   let str = String::from_str(s).unwrap();
-  let mut parser = SourceTextParser::new(&str);
-  parser.skip_delimiters();
+  let mut parser = SourceTextParser::new(str.as_bytes());
+  parser.skip_trivia();
   let CharsData { offset_from_start, offset_from_head } =
     parser.parse_identifier().unwrap();
   let str = unsafe {
@@ -744,7 +750,7 @@ fn ident_parser_() {
   let s =
     "   \n ZazA zAZa";
   let str = String::from_str(s).unwrap();
-  let mut parser = SourceTextParser::new(&str);
+  let mut parser = SourceTextParser::new(str.as_bytes());
   let depth = parser.probe_depth();
   assert!(depth == 1);
   let _ = parser.parse_identifier().unwrap();
@@ -759,7 +765,7 @@ fn decl_parse() {
     "".to_string() +
     "k : i = k => (* -> *) = (cons a _: expr a b) \nand pt { -> => and }"
     ;
-  let mut parser = SourceTextParser::new(&s);
+  let mut parser = SourceTextParser::new(s.as_bytes());
   // let depth = parser.probe_depth();
   let expr = parser.parse_top_level_decl();
   match expr {
@@ -781,9 +787,8 @@ fn expr_parse() {
     "".to_string() +
     "{ (,) a b => a (a,b) ((,) a b) }"
     ;
-  let mut parser = SourceTextParser::new(&s);
-  let depth = parser.probe_depth();
-  let expr = parser.parse_expr(depth);
+  let mut parser = SourceTextParser::new(s.as_bytes());
+  let expr = parser.parse_expr();
   match expr {
     Err(err) => println!("{:?}", err),
     Ok(expr) => {
@@ -793,22 +798,20 @@ fn expr_parse() {
 }
 #[test] #[ignore]
 fn depth_test() {
-  let s =
+  let mut s =
     "".to_string() +
-    "k : () = (() = (a = b => c) => ())"
+    "N : * = () or N;" +
+    "N : * = () or N" +
+    ""
     ;
-  let mut parser = SourceTextParser::new(&s);
-  // let depth = parser.probe_depth();
+  for _ in s.len() .. (s.len().next_multiple_of(size_of::<u8x4>())) {
+    s.push(Letters::EOT as char);
+  }
+  let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_to_end();
   match expr {
     Err(err) => println!("{:?}", err),
     Ok(decls) => {
-      // let mut str = String::new();
-      // let chars = parser.chars.as_ptr();
-      // render_raw_texpr(&tyexpr, chars, &mut str);
-      // str.push_str(" = ");
-      // render_raw_texpr(&oexpr, chars, &mut str);
-      // println!("{}", str)
       println!("{:#?}", decls)
     }
   }

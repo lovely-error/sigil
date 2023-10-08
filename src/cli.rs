@@ -1,231 +1,59 @@
 
 use core::panic;
-use std::{fs::File, path::{Path, self}, io::{Write, Read, self, Stdout, BufWriter, stdout, Stdin, stdin}, str::FromStr, cell::UnsafeCell, net::{TcpListener, TcpStream, SocketAddr, SocketAddrV4}, mem::{transmute_copy, replace}, sync::mpsc::Receiver,};
+use std::{fs::File, path::{Path, self}, io::{Write, Read, self, Stdout, BufWriter, stdout, Stdin, stdin}, str::FromStr, cell::UnsafeCell, net::{TcpListener, TcpStream, SocketAddr, SocketAddrV4}, mem::{transmute_copy, replace, size_of}, sync::mpsc::Receiver, any::Any, simd::u8x4,};
 
-use crate::{driver::{TaskContext, Continuation, WorkGroupRef, WorkGroup}, utils::{with_scoped_consume, PageSource}, mpsc::{MPSCQueue}, garbage};
+use crate::{driver::{TaskContext, Continuation, WorkGroupRef, WorkGroup}, utils::{with_scoped_consume, PageSource}, mpsc::{MPSCQueue}, garbage, lexer::{SourceTextParser, Letters, RawDecl, ParseFailure}, parser::resolve_precendece, sema::{DeclCheckCtx, ScopedDecl, self, SemanticError}};
 
 
 pub fn main() {
-  main_impl()
+  let _ = main_impl();
   // basic()
 }
 
 #[test]
 fn test() {
-  main_impl()
+  let _ = main_impl();
 }
-
-
 
 fn main_impl() {
-  let work_group = WorkGroup::new();
-  work_group.submit_and_await(garbage!(CliCtx), cli_iface_begin);
-}
 
-struct CliCtx {
-  stdout: BufWriter<Stdout>,
-  stdin: Stdin,
-  stdin_read_buffer: String,
-  server_started: bool
-}
-impl CliCtx {
-  fn new() -> Self {
-    CliCtx {
-      stdout: BufWriter::new(stdout()),
-      stdin: stdin(),
-      stdin_read_buffer: String::new(),
-      server_started: false
-    }
-  }
-  fn append_to_output(&mut self, str: &str) {
-    self.stdout.write(str.as_bytes()).unwrap();
-  }
-  fn commit(&mut self) {
-    self.stdout.flush().unwrap();
-  }
-  fn print(&mut self, str: &str) {
-    self.commit();
-    self.append_to_output(str);
-    self.commit();
-  }
-  fn read_from_terminal(&mut self) -> String {
-    self.stdin.read_line(&mut self.stdin_read_buffer).unwrap();
-    let str = replace(&mut self.stdin_read_buffer, String::new());
-    return str
-  }
-}
+    let mut out = BufWriter::new(stdout());
+    let in_ = stdin();
 
-fn cli_iface_begin(ctx: &TaskContext) -> Continuation {
+    let mut inp_str = String::new();
 
-  let ctx_data = CliCtx::new();
-  let raw_frame = ctx.acccess_frame_as_raw().cast::<CliCtx>();
-  unsafe { raw_frame.write(ctx_data) };
-  let frame = unsafe {&mut *raw_frame};
+    let mut println = |msg:&str| {
+      let _ = out.write(msg.as_bytes());
+      let _ = out.write("\n".as_bytes());
+      let _ = out.flush();
+    };
 
-  let greeting = build_greeting(90);
-  frame.append_to_output("\n\n");
-  frame.append_to_output(&greeting);
-  frame.append_to_output("\n");
-  frame.commit();
+    let greeting = build_greeting(80);
+    println(&greeting);
 
-  return Continuation::then(cli_iface_main_loop)
-}
-
-fn cli_iface_main_loop(ctx:&TaskContext) -> Continuation {
-  let frame = ctx.access_frame_as_init::<CliCtx>();
-  frame.print("\n> ");
-  let iofd = &frame.stdin;
-  return Continuation::await_io(iofd, true, false, |ctx| {
-    let frame = ctx.access_frame_as_init::<CliCtx>();
-    let inp = frame.read_from_terminal();
-    if inp.is_empty() {
-      frame.print("No command has been given");
-      return Continuation::then(cli_iface_main_loop);
-    }
-    let components = inp
-      .trim()
-      .split(|e| e == ' ')
-      .collect::<Vec<_>>();
-    match components[0] {
-      "help" => {
-        let help = help_message();
-        frame.print(&help);
-        return Continuation::then(cli_iface_main_loop)
-      },
-      "exit" => {
-        return Continuation::done()
-      },
-      "server" => {
-        let len = components.len();
-        if len < 2 {
-          frame.print("invalid invocation of server command");
-          return Continuation::then(cli_iface_main_loop)
-        }
-        match len {
-          2 if components[1] == "start" => {
-            let started = &mut frame.server_started;
-            if *started {
-              frame.print("server was already started");
-              return Continuation::then(cli_iface_main_loop);
-            }
-            *started = true;
-            let listener_ = TcpListener::bind("localhost:13137").unwrap();
-            frame.print(&format!("started server at {}", listener_.local_addr().unwrap()));
-            ctx.spawn_detached_task(
-              SocketManCtx {
-                listener: listener_,
-                stream: None,
-                buffer: Vec::new()
-              },
-              socket_man);
-            return Continuation::then(cli_iface_main_loop)
-          },
-          2 if components[1] == "stop" => {
-            let started = &mut frame.server_started;
-            if !*started {
-              frame.print("server was not started");
-              return Continuation::then(cli_iface_main_loop)
-            }
-            frame.print("stopping serv is not impled");
-            return Continuation::then(cli_iface_main_loop)
-          },
-          3 if components[1] == "start" => {
-            todo!()
-          },
-          _ => {
-            frame.print("invalid invocation of server command");
-            return Continuation::then(cli_iface_main_loop)
-          }
-        }
-      },
-      "load_from_file" => {
-        if components.len() != 2 {
-          frame.print(
-            "expected command and filepath, but got something else");
-          return Continuation::then(cli_iface_main_loop)
-        }
-        let path_str = components[1];
-        let file = File::open(path_str) ;
-        match file {
-          Err(err) => {
-            frame.print(format!("cant open file at {} because {}", path_str, err).as_str());
-            return Continuation::then(cli_iface_main_loop);
-          },
-          Ok(mut file) => {
-            let stdout = &mut frame.stdout;
-            let outcome = io::copy(&mut file, stdout);
-            match outcome {
-              Err(err) => {
-                frame.print(
-                  format!("failed to write file to stdout because {}", err).as_str())
-              },
-              Ok(_) => ()
-            }
-            return Continuation::then(cli_iface_main_loop)
-          }
-        }
-      },
-      _ => {
-        frame.print("Unknown command has been given");
-        return Continuation::then(cli_iface_main_loop);
+    'main:loop {
+      inp_str.clear();
+      let _ = in_.read_line(&mut inp_str);
+      if inp_str.is_empty() {
+        println("No command has been given");
+        continue;
       }
-    }
-  });
-}
-
-struct SocketManCtx {
-  listener: TcpListener,
-  stream: Option<(TcpStream, SocketAddr)>,
-  buffer: Vec<u8>,
-}
-fn socket_man(ctx: &TaskContext) -> Continuation {
-  let frame = ctx.access_frame_as_init::<SocketManCtx>();
-  frame.listener.set_nonblocking(true).unwrap();
-  return Continuation::then(socket_setup)
-}
-fn socket_setup(ctx: &TaskContext) -> Continuation {
-  let frame = ctx.access_frame_as_init::<SocketManCtx>() ;
-  let outcome = frame.listener.accept();
-  match outcome {
-    Ok(conn) => {
-      conn.0.set_nonblocking(true).unwrap();
-      frame.stream = Some(conn);
-      return Continuation::then(socket_read_loop)
-    },
-    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-
-      return Continuation::await_io(&frame.listener, true, false, socket_setup);
-    }
-    _ => panic!()
-  }
-}
-fn socket_read_loop(ctx: &TaskContext) -> Continuation {
-  let frame = ctx.access_frame_as_init::<SocketManCtx>();
-  if let Some((stream, _)) = &mut frame.stream {
-    return Continuation::await_io(&*stream, true, false, |ctx| {
-      let frame = ctx.access_frame_as_init::<SocketManCtx>() ;
-      let (stream, _) = frame.stream.as_mut().unwrap();
-      let outcome = stream.read_to_end(&mut frame.buffer);
-      match outcome {
-        Ok(_) => {
-          return process_bytes_from_socket(&mut frame.buffer, ctx)
-        },
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-          println!("listening on conn would block");
-          return Continuation::await_io(&*stream, true, false, socket_read_loop)
-        },
-        _ => panic!()
+      let components = inp_str
+        .trim()
+        .split(|e| e == ' ')
+        .collect::<Vec<_>>();
+      let head = components[0];
+      if head == "exit" { return }
+      for (name, _, fun) in COMMANDS {
+        if *name == head {
+          fun(&components, &mut println);
+          continue 'main;
+        }
       }
-    });
-  } else {
-    panic!()
-  }
-}
-fn process_bytes_from_socket(bytes: &mut Vec<u8>, ctx: &TaskContext) -> Continuation {
-  let frame = unsafe { &mut *ctx.access_frame_as_init::<SocketManCtx>() };
-  let bytes = replace(bytes, Vec::new());
-  // ctx.send_message(&frame.printer_ref, PrinterMsg::PrintBytes(bytes));
-  return Continuation::then(socket_read_loop)
+      println("Unknown command has been given");
+      continue;
+    }
+
 }
 
 fn build_greeting(term_width: usize) -> String {
@@ -251,16 +79,78 @@ fn build_greeting(term_width: usize) -> String {
   return header;
 }
 
+const COMMANDS : &[(&str, &str, fn (&Vec<&str>, &mut dyn FnMut(&str)))] = &[
+  ("help", "prints help message", |_, prt|{
+    let hmsg = help_message();
+    prt(&hmsg);
+  }),
+  ("lff", "loads items defined in a given textual file", |components, printer|{
+    if components.len() != 2 {
+      printer("expected command and filepath, but got something else");
+    }
+    let path_str = components[1];
+    let file = File::open(path_str) ;
+    match file {
+      Err(err) => {
+        let err_msg = format!("cant open file at {} because {}", path_str, err);
+        printer(&err_msg);
+        return;
+      },
+      Ok(mut file) => {
+        let mut bytes = Vec::new();
+        let _ = file.read_to_end(&mut bytes);
+        for _ in bytes.len() .. bytes.len().next_multiple_of(size_of::<u8x4>()) {
+          bytes.push(Letters::EOT);
+        }
+        let out = build_defs(bytes.as_slice());
+        printer(&format!("{:#?}", out));
+        return;
+      }
+    }
+  }),
+  ("give", "begins a term forming session", |_, ptr|{
+    ptr("not implemented yet");
+    return;
+  }),
+  ("exit", "terminates the programm", |_, prt|{
+    prt("bye");
+    return;
+  })
+];
+
 fn help_message() -> String {
-  "".to_string() +
-  "exit\n" +
-  "  terminates the programm\n" +
-  "load_from_file <file_path>\n" +
-  "  loads definitions from text file\n" +
-  "server start <sock_addr>?\n" +
-  "  starts server at provided address. if none given uses default\n" +
-  "  localhost:13137\n" +
-  "server stop\n" +
-  "  terminates the server"
+  let mut str = String::new();
+  for (cname, desc, _) in COMMANDS {
+    str.push_str(&cname);
+    str.push_str("\n    ");
+    str.push_str(&desc);
+    str.push_str("\n");
+  }
+  return str
 }
 
+#[derive(Debug)]
+enum SomeError {
+  SemanticErrors(Vec<SemanticError>),
+  ParseError(ParseFailure)
+}
+
+fn build_defs(
+  bytes: &[u8],
+) -> Result<Vec<ScopedDecl>, SomeError>{
+  let mut parser = SourceTextParser::new(bytes);
+  let res = parser.parse_to_end();
+  match res {
+    Ok(defs) => {
+      let mut scchk = DeclCheckCtx::new(bytes);
+      let out = sema::check_decls(&mut scchk, &defs);
+      if let Some(errs) = scchk.get_errors_if_any() {
+        return Err(SomeError::SemanticErrors(errs));
+      }
+      return Ok(out);
+    },
+    Err(err) => {
+      return Err(SomeError::ParseError(err));
+    },
+  }
+}

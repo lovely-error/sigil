@@ -1,7 +1,22 @@
 use std::any::Any;
 
-use crate::parser::PrecedenceResolvedTExpr;
+use crate::{parser::{AtomRef, LiftKind, RefinedPExpr}, lexer::CharsData};
 
+
+#[derive(Debug, Clone)]
+pub enum TypeCheckerTExpr {
+  App(Box<Self>, Vec<Self>),
+  Ref(CharsData),
+  AtomRef(AtomRef),
+  Lift(LiftKind, RefinedPExpr, Box<Self>, Box<Self>),
+  Star,
+  Let(Vec<(RefinedPExpr, Self)>, Box<Self>),
+  Lambda(Vec<(Vec<RefinedPExpr>, Self)>),
+  Pt,
+  Void,
+
+  Meta
+}
 
 enum ReductionError {
   InvalidRef(String)
@@ -10,34 +25,26 @@ struct ReductionCtx {
 
 }
 type Maybe<T> = Result<T, Box<dyn Any>>;
-fn realise(
+fn rewrite(
   ctx: &mut ReductionCtx,
-  obj: &PrecedenceResolvedTExpr
-) -> PrecedenceResolvedTExpr {
+  obj: &TypeCheckerTExpr
+) -> TypeCheckerTExpr {
   match obj {
-    PrecedenceResolvedTExpr::App(head, args) => {
-      todo!()
-    },
-    PrecedenceResolvedTExpr::Ref(_) => {
-      todo!()
-    },
-    PrecedenceResolvedTExpr::AtomRef(_) => todo!(),
-    PrecedenceResolvedTExpr::Arrow(_, _) => todo!(),
-    PrecedenceResolvedTExpr::DArrow(_, _, _) => todo!(),
-    PrecedenceResolvedTExpr::And(_, _) => todo!(),
-    PrecedenceResolvedTExpr::DAnd(_, _, _) => todo!(),
-    PrecedenceResolvedTExpr::Or(_, _) => todo!(),
-    PrecedenceResolvedTExpr::Star => todo!(),
-    PrecedenceResolvedTExpr::Let(_, _) => todo!(),
-    PrecedenceResolvedTExpr::Lambda(_) => todo!(),
-    PrecedenceResolvedTExpr::Tilda(_, _) => todo!(),
-    PrecedenceResolvedTExpr::Tuple(_, _) => todo!(),
-    PrecedenceResolvedTExpr::Pt => todo!(),
-    PrecedenceResolvedTExpr::Void => todo!(),
-    PrecedenceResolvedTExpr::Inl(_) => todo!(),
-    PrecedenceResolvedTExpr::Inr(_) => todo!(),
+    TypeCheckerTExpr::App(_, _) => todo!(),
+    TypeCheckerTExpr::Ref(_) => todo!(),
+    TypeCheckerTExpr::AtomRef(_) => todo!(),
+    TypeCheckerTExpr::Lift(_, _, _, _) => todo!(),
+    TypeCheckerTExpr::Star => todo!(),
+    TypeCheckerTExpr::Let(_, _) => todo!(),
+    TypeCheckerTExpr::Lambda(_) => todo!(),
+    TypeCheckerTExpr::Pt => todo!(),
+    TypeCheckerTExpr::Void => todo!(),
+    TypeCheckerTExpr::Meta => todo!(),
   }
 }
 fn substitute() -> Maybe<()> {
+  todo!()
+}
+fn bind() -> Maybe<()> {
   todo!()
 }

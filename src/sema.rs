@@ -1,24 +1,28 @@
 use std::{collections::{HashSet, HashMap}, any::Any, cell::UnsafeCell, hash::Hash};
 
 use crate::{
-  parser::{PrecedenceResolvedTExpr, AtomRef, RefinedPExpr, resolve_precendece},
+  parser::{PrecedenceResolvedTExpr, AtomRef, RefinedPExpr, resolve_precendece, LiftKind, PrecedenceResolutionError},
   lexer::{CharsData, RawDecl, SourceTextParser}, utils::SomeDebug
 };
 
 #[derive(Debug)]
-struct ScopedDecl(u32, ScopedTExpr, ScopedTExpr);
+pub struct ScopedDecl(u32, ScopedTExpr, ScopedTExpr);
 
-struct DeclCheckCtx<'i> {
-  chars: &'i String,
+pub struct DeclCheckCtx<'i> {
+  chars: &'i [u8],
   encountered_names: HashMap<&'i str, u32>,
   errors: Vec<SemanticError>,
 }
 impl <'i> DeclCheckCtx<'i> {
-  fn new(names: &'i String) -> Self {
+  pub fn new(names: &'i [u8]) -> Self {
     Self { chars: names, encountered_names: HashMap::new(), errors: Vec::new() }
   }
+  pub fn get_errors_if_any(&self) -> Option<Vec<SemanticError>> {
+    if self.errors.is_empty() { return None ;}
+    Some(self.errors.clone())
+  }
 }
-fn check_decls(ctx: &mut DeclCheckCtx, decls: &Vec<RawDecl>) -> Vec<ScopedDecl> {
+pub fn check_decls(ctx: &mut DeclCheckCtx, decls: &Vec<RawDecl>) -> Vec<ScopedDecl> {
   let str = |&CharsData { offset_from_start, offset_from_head }| unsafe {
     std::str::from_utf8(std::slice::from_raw_parts(
       ctx.chars.as_ptr().add(offset_from_start as usize), offset_from_head as usize))
@@ -57,11 +61,11 @@ fn check_decls(ctx: &mut DeclCheckCtx, decls: &Vec<RawDecl>) -> Vec<ScopedDecl> 
               }
             },
             (Err(err1), Err(err2)) => {
-              ctx.errors.push(SemanticError::SomeError(err1));
-              ctx.errors.push(SemanticError::SomeError(err2))
+              ctx.errors.push(SemanticError::PrecedenceError(err1));
+              ctx.errors.push(SemanticError::PrecedenceError(err2))
             },
             (Err(err), _) | (_, Err(err)) => {
-              ctx.errors.push(SemanticError::SomeError(err))
+              ctx.errors.push(SemanticError::PrecedenceError(err))
             },
           }
         }
@@ -73,37 +77,32 @@ fn check_decls(ctx: &mut DeclCheckCtx, decls: &Vec<RawDecl>) -> Vec<ScopedDecl> 
 }
 
 #[derive(Debug)]
-enum ScopedTExpr {
+pub enum ScopedTExpr {
   App(Box<Self>, Vec<Self>),
   GlobalRef(u32),
   SubstRef(u32),
   AtomRef(AtomRef),
-  Arrow(Box<Self>, Box<Self>),
-  DArrow(RefinedPExpr, Box<Self>, Box<Self>),
-  And(Box<Self>, Box<Self>),
-  DAnd(RefinedPExpr, Box<Self>, Box<Self>),
-  Or(Box<Self>, Box<Self>),
+  Lift(LiftKind,RefinedPExpr, Box<Self>, Box<Self>),
   Star,
   Let(Vec<(RefinedPExpr, Self)>, Box<Self>),
   Lambda(Vec<(Vec<RefinedPExpr>, Self)>),
-  Tilda(Box<Self>, Box<Self>),
   Pt,
   Void,
-  Inl(Box<Self>),
-  Inr(Box<Self>),
-  Tuple(Box<Self>, Box<Self>)
 }
 
-#[derive(Debug)]
-enum SemanticError {
-  InvalidAppHead, ReservedName, DuplicateName,
-  IncorrectArgNum, InvalidRef,
-  SomeError(Box<dyn Any>)
+#[derive(Debug, Clone)]
+pub enum SemanticError {
+  InvalidAppHead,
+  ReservedName,
+  DuplicateName,
+  IncorrectArgNum,
+  InvalidRef(String),
+  PrecedenceError(PrecedenceResolutionError),
 }
-struct SemaCheckCtx<'i> {
+pub struct SemaCheckCtx<'i> {
   aggregated_errors: Vec<SemanticError>,
   encountered_names: &'i HashMap<&'i str, u32>,
-  chars: &'i String,
+  chars: &'i [u8],
 }
 
 type Maybe<T> = Option<T>;
@@ -130,56 +129,6 @@ fn check_scope(
       let head = head.unwrap();
       return Some(ScopedTExpr::App(Box::new(head), args_));
     },
-    PrecedenceResolvedTExpr::Tuple(l, r) => {
-      let l = check_scope(ctx, l, binders_vars);
-      let r = check_scope(ctx, r, binders_vars);
-      match (l, r) {
-        (Some(l), Some(r)) => {
-          return Some(ScopedTExpr::Tuple(Box::new(l), Box::new(r)))
-        },
-        _ => return None
-      }
-    }
-    PrecedenceResolvedTExpr::Arrow(l, r) => {
-      let l = check_scope(ctx, l, binders_vars);
-      let r = check_scope(ctx, r, binders_vars);
-      match (l, r) {
-        (Some(l), Some(r)) => {
-          return Some(ScopedTExpr::Arrow(Box::new(l), Box::new(r)))
-        },
-        _ => return None
-      }
-    }
-    PrecedenceResolvedTExpr::And(l, r) => {
-      let l = check_scope(ctx, l, binders_vars);
-      let r = check_scope(ctx, r, binders_vars);
-      match (l, r) {
-        (Some(l), Some(r)) => {
-          return Some(ScopedTExpr::And(Box::new(l), Box::new(r)))
-        },
-        _ => return None
-      }
-    }
-    PrecedenceResolvedTExpr::Or(l, r) => {
-      let l = check_scope(ctx, l, binders_vars);
-      let r = check_scope(ctx, r, binders_vars);
-      match (l, r) {
-        (Some(l), Some(r)) => {
-          return Some(ScopedTExpr::Or(Box::new(l), Box::new(r)))
-        },
-        _ => return None
-      }
-    }
-    PrecedenceResolvedTExpr::Tilda(l, r) => {
-      let l = check_scope(ctx, l, binders_vars);
-      let r = check_scope(ctx, r, binders_vars);
-      match (l, r) {
-        (Some(l), Some(r)) => {
-          return Some(ScopedTExpr::Tilda(Box::new(l), Box::new(r)))
-        },
-        _ => return None
-      }
-    },
     PrecedenceResolvedTExpr::Ref(chars) => {
       let ident = get_name(ctx.chars, chars);
       if let Some(bctx) = binders_vars {
@@ -190,12 +139,12 @@ fn check_scope(
       if let Some(ix) = ctx.encountered_names.get(ident) {
         return Some(ScopedTExpr::GlobalRef(*ix))
       } else {
-        ctx.aggregated_errors.push(SemanticError::InvalidRef);
+        ctx.aggregated_errors.push(SemanticError::InvalidRef(ident.to_string()));
         return None
       }
     },
     PrecedenceResolvedTExpr::AtomRef(atom) => return Some(ScopedTExpr::AtomRef(*atom)),
-    PrecedenceResolvedTExpr::DArrow(bind, head, spine) => {
+    PrecedenceResolvedTExpr::Lift(k, bind, head, spine) => {
       let chk_head = check_scope(ctx, head, binders_vars);
       let binders_store = if let Some(bin_store) = binders_vars {
         bin_store.clone()
@@ -210,27 +159,7 @@ fn check_scope(
       }
       match (chk_head, chk_spine) {
         (Some(head), Some(spine)) => {
-          return Some(ScopedTExpr::DArrow(bind.clone(), Box::new(head), Box::new(spine)))
-        },
-        _ => return None
-      }
-    },
-    PrecedenceResolvedTExpr::DAnd(bind, head, spine) => {
-      let chk_head = check_scope(ctx, head, binders_vars);
-      let binders_store = if let Some(bin_store) = binders_vars {
-        bin_store.clone()
-      } else { HashMap::new() };
-      let mut cbctx = CollectBinderCtx {
-        binders: binders_store,
-        errors: Vec::new(), str: ctx.chars, index: 0 };
-      collect_binders(&mut cbctx, bind);
-      let chk_spine = check_scope(ctx, spine, Some(&cbctx.binders));
-      if !cbctx.errors.is_empty() {
-        ctx.aggregated_errors.append(&mut cbctx.errors);
-      }
-      match (chk_head, chk_spine) {
-        (Some(head), Some(spine)) => {
-          return Some(ScopedTExpr::DAnd(bind.clone(), Box::new(head), Box::new(spine)))
+          return Some(ScopedTExpr::Lift(*k,bind.clone(), Box::new(head), Box::new(spine)))
         },
         _ => return None
       }
@@ -242,11 +171,11 @@ fn check_scope(
       } else { HashMap::new() };
       let mut cbctx = CollectBinderCtx {
         binders: binders_store, errors: Vec::new(), str: ctx.chars, index: 0 };
-      for (pexpr, _) in items {
+      for (pexpr, _, _) in items {
         collect_binders(&mut cbctx, pexpr);
       }
       let mut items_ = Vec::new();
-      for (pexpr, expr) in items {
+      for (pexpr, _, expr) in items {
         if let Some(expr) =  check_scope(ctx, expr, Some(&cbctx.binders)) {
           items_.push((pexpr.clone(),expr))
         }
@@ -282,14 +211,6 @@ fn check_scope(
     },
     PrecedenceResolvedTExpr::Pt => return Some(ScopedTExpr::Pt),
     PrecedenceResolvedTExpr::Void => return Some(ScopedTExpr::Void),
-    PrecedenceResolvedTExpr::Inl(t) => {
-      let t = check_scope(ctx, t, binders_vars)?;
-      return Some(ScopedTExpr::Inl(Box::new(t)))
-    },
-    PrecedenceResolvedTExpr::Inr(t) => {
-      let t = check_scope(ctx, t, binders_vars)?;
-      return Some(ScopedTExpr::Inr(Box::new(t)))
-    },
   }
 }
 
@@ -307,7 +228,7 @@ fn check_clause(
 
 }
 
-pub fn get_name<'i, 'k>(str: &'i String, chars: &'k CharsData) -> &'i str {
+pub fn get_name<'i, 'k>(str: &'i [u8], chars: &'k CharsData) -> &'i str {
   unsafe {
     let slice = std::slice::from_raw_parts(
       str.as_ptr().add(chars.offset_from_start as usize),
@@ -316,50 +237,8 @@ pub fn get_name<'i, 'k>(str: &'i String, chars: &'k CharsData) -> &'i str {
   }
 }
 
-fn get_arity(
-  ctx: &mut SemaCheckCtx,
-  expr: &PrecedenceResolvedTExpr
-) -> Maybe<usize> {
-  match expr {
-    PrecedenceResolvedTExpr::AtomRef(atom) => {
-      match atom {
-        AtomRef::And | AtomRef::Arrow | AtomRef::Or | AtomRef::Tilda |
-        AtomRef::TupleCtor => {
-          return Some(2)
-        }
-        AtomRef::Inl | AtomRef::Inr=> return Some(1),
-      }
-    },
-    PrecedenceResolvedTExpr::App(head, args) => {
-      let head_arity = get_arity(ctx, head)?;
-      let arg_count = args.len();
-      if arg_count > head_arity {
-        ctx.aggregated_errors.push(SemanticError::IncorrectArgNum);
-        return None
-      }
-      return Some(head_arity - arg_count)
-    }
-    PrecedenceResolvedTExpr::Lambda(_) => {
-      todo!()
-    }
-    PrecedenceResolvedTExpr::Ref(_) => {
-      todo!()
-    }
-    _ => ()
-  }
-  let mut obj = expr;
-  let mut count = 0;
-  while let
-    PrecedenceResolvedTExpr::Arrow(_, tail) |
-    PrecedenceResolvedTExpr::DArrow(_, _, tail) = obj {
-    count += 1;
-    obj = tail;
-  }
-  return Some(count)
-}
-
 struct CollectBinderCtx<'i> {
-  str: &'i String,
+  str: &'i [u8],
   errors: Vec<SemanticError>,
   binders: HashMap<&'i str, u32>,
   index: u32,
@@ -383,16 +262,6 @@ fn collect_binders(
         ctx.errors.push(SemanticError::DuplicateName)
       }
     },
-    RefinedPExpr::Tuple(l, r) |
-    RefinedPExpr::Arrow(l, r) |
-    RefinedPExpr::Tilda(l, r) |
-    RefinedPExpr::Or(l, r) |
-    RefinedPExpr::And(l, r) => {
-      collect_binders(ctx, l);
-      collect_binders(ctx, r)
-    },
-    RefinedPExpr::Inr(t) |
-    RefinedPExpr::Inl(t) => collect_binders(ctx, t),
     RefinedPExpr::Group(_, subpats) => {
       for subpat in subpats {
         collect_binders(ctx, subpat)
@@ -408,13 +277,13 @@ fn delc_cheking() {
     "k : () -> ! = { () => (i: ()) and k i }\n" +
     "d : () -> ! = { () => (i: ()) and k i }"
     ;
-  let mut parser = SourceTextParser::new(&s);
+  let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_to_end();
   match expr {
     Err(err) => println!("{:?}", err),
     Ok(raw_decls) => {
       println!("{:#?}", raw_decls);
-      let mut ctx = DeclCheckCtx::new(&parser.chars);
+      let mut ctx = DeclCheckCtx::new(s.as_bytes());
       let decls = check_decls(&mut ctx, &raw_decls);
       if !ctx.errors.is_empty() {
         println!("{:#?}", ctx.errors)

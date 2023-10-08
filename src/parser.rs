@@ -1,6 +1,6 @@
-use std::any::Any;
+use std::{any::Any, mem::size_of, simd::u8x4};
 
-use crate::{lexer::{CharsData, RawPExpr, RawTExpr, Lift, LetGroup, Lambda, Clause, SourceTextParser, RawDecl}, root_alloc::RootAllocator, sema::get_name};
+use crate::{lexer::{CharsData, RawPExpr, RawTExpr, Lift, LetGroup, Lambda, Clause, SourceTextParser, RawDecl, Letters}, root_alloc::RootAllocator, sema::get_name};
 
 
 
@@ -8,27 +8,26 @@ use crate::{lexer::{CharsData, RawPExpr, RawTExpr, Lift, LetGroup, Lambda, Claus
 pub enum RefinedPExpr {
   Discard,
   Ref(CharsData),
-  And(Box<Self>, Box<Self>),
-  Or(Box<Self>, Box<Self>),
-  Inl(Box<Self>),
-  Inr(Box<Self>),
-  Tuple(Box<Self>, Box<Self>),
-  Arrow(Box<Self>, Box<Self>),
-  Tilda(Box<Self>, Box<Self>),
   AtomRef(AtomRef),
   Group(Box<Self>, Vec<Self>),
   Pt
 }
+#[derive(Debug, Clone, Copy)]
+pub enum PrecedenceResolutionError {
+  OrderError
+}
 
-struct NameResolutionError;
-type Maybe<R> = Result<R, Box<dyn Any>>;
-fn resolve_pexpr(inp: &String, pexpr: &RawPExpr) -> Maybe<RefinedPExpr> {
+type Maybe<R> = Result<R, PrecedenceResolutionError>;
+fn resolve_pexpr(inp: &[u8], pexpr: &RawPExpr) -> Maybe<RefinedPExpr> {
   match pexpr {
     RawPExpr::HeadTuple => Ok(RefinedPExpr::AtomRef(AtomRef::TupleCtor)),
     RawPExpr::Tuple(l, r) => {
       let l = resolve_pexpr(inp, l)?;
       let r = resolve_pexpr(inp, r)?;
-      return Ok(RefinedPExpr::Tuple(Box::new(l), Box::new(r)))
+      let expr = RefinedPExpr::Group(
+        Box::new(RefinedPExpr::AtomRef(AtomRef::TupleCtor)),
+        [l,r].to_vec());
+      return Ok(expr)
     },
     RawPExpr::Discard => Ok(RefinedPExpr::Discard),
     RawPExpr::Chars(chars) => {
@@ -44,9 +43,8 @@ fn resolve_pexpr(inp: &String, pexpr: &RawPExpr) -> Maybe<RefinedPExpr> {
     RawPExpr::Pt => Ok(RefinedPExpr::Pt),
   }
 }
-fn resolve_pexprs(inp: &String, pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
+fn resolve_pexprs(inp: &[u8], pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
   let len = pexprs.len();
-  if len == 0 { return Err(Box::new(NameResolutionError)) }
   if len == 1 { return resolve_pexpr(inp, &pexprs[0]) }
   let mut ix = 0 ;
   while ix != len {
@@ -59,10 +57,12 @@ fn resolve_pexprs(inp: &String, pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
         (false, false) => {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
-          let box_ = |e| Box::new(e);
-          return Ok(RefinedPExpr::Arrow(box_(left), box_(right)))
+          let expr = RefinedPExpr::Group(
+            Box::new(RefinedPExpr::AtomRef(AtomRef::Arrow)),
+            [left, right].to_vec());
+          return Ok(expr)
         },
-        _ => return Err(Box::new(NameResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     if let RawPExpr::Tilda = item {
@@ -73,10 +73,12 @@ fn resolve_pexprs(inp: &String, pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
         (false, false) => {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
-          let box_ = |e| Box::new(e);
-          return Ok(RefinedPExpr::Tilda(box_(left), box_(right)))
+          let expr = RefinedPExpr::Group(
+            Box::new(RefinedPExpr::AtomRef(AtomRef::Tilda)),
+            [left, right].to_vec());
+          return Ok(expr)
         },
-        _ => return Err(Box::new(NameResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     if let RawPExpr::Or = item {
@@ -87,10 +89,12 @@ fn resolve_pexprs(inp: &String, pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
         (false, false) => {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
-          let box_ = |e| Box::new(e);
-          return Ok(RefinedPExpr::Or(box_(left), box_(right)))
+          let expr = RefinedPExpr::Group(
+            Box::new(RefinedPExpr::AtomRef(AtomRef::Or)),
+            [left, right].to_vec());
+          return Ok(expr)
         },
-        _ => return Err(Box::new(NameResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     if let RawPExpr::And = item {
@@ -101,17 +105,19 @@ fn resolve_pexprs(inp: &String, pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
         (false, false) => {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
-          let box_ = |e| Box::new(e);
-          return Ok(RefinedPExpr::And(box_(left), box_(right)))
+          let expr = RefinedPExpr::Group(
+            Box::new(RefinedPExpr::AtomRef(AtomRef::And)),
+            [left, right].to_vec());
+          return Ok(expr)
         },
-        _ => return Err(Box::new(NameResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     ix += 1;
   };
   return resolve_app_pexpr(inp, pexprs)
 }
-fn resolve_app_pexpr(inp: &String,pexpr: &[RawPExpr]) -> Maybe<RefinedPExpr> {
+fn resolve_app_pexpr(inp: &[u8], pexpr: &[RawPExpr]) -> Maybe<RefinedPExpr> {
   let head = resolve_pexpr(inp, &pexpr[0])?;
   let mut args = Vec::new();
   for item in &pexpr[1..] {
@@ -119,43 +125,40 @@ fn resolve_app_pexpr(inp: &String,pexpr: &[RawPExpr]) -> Maybe<RefinedPExpr> {
   }
   return Ok(RefinedPExpr::Group(Box::new(head), args))
 }
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
+pub enum LiftKind {
+  Arrow, And
+}
+#[derive(Debug, Clone)]
 pub enum PrecedenceResolvedTExpr {
   App(Box<Self>, Vec<Self>),
   Ref(CharsData),
   AtomRef(AtomRef),
-  Arrow(Box<Self>, Box<Self>),
-  DArrow(RefinedPExpr, Box<Self>, Box<Self>),
-  And(Box<Self>, Box<Self>),
-  DAnd(RefinedPExpr, Box<Self>, Box<Self>),
-  Or(Box<Self>, Box<Self>),
+  Lift(LiftKind, RefinedPExpr, Box<Self>, Box<Self>),
   Star,
-  Let(Vec<(RefinedPExpr, Self)>, Box<Self>),
+  Let(Vec<(RefinedPExpr, Self, Self)>, Box<Self>),
   Lambda(Vec<(Vec<RefinedPExpr>, Self)>),
-  Tilda(Box<Self>, Box<Self>),
-  Tuple(Box<Self>, Box<Self>),
   Pt,
   Void,
-  Inl(Box<Self>),
-  Inr(Box<Self>)
 }
 #[derive(Debug, Clone, Copy)]
 pub enum AtomRef { And, Or, Arrow, Tilda, TupleCtor, Inl, Inr }
 
 pub fn resolve_precendece(
-  inp: &String,
+  inp: &[u8],
   texpr: &RawTExpr
 ) -> Maybe<PrecedenceResolvedTExpr> {
   return resolve_singular(inp,texpr)
 }
-pub struct PrecedenceResolutionError;
+
 fn split_tokens(
-  inp: &String,
+  inp: &[u8],
   tokens: &[RawTExpr]
 ) -> Maybe<PrecedenceResolvedTExpr> {
   let end_index = tokens.len();
-  if end_index == 0 { return Err(Box::new(PrecedenceResolutionError)) }
+  if end_index == 0 {
+    return Err(PrecedenceResolutionError::OrderError);
+  }
   if end_index == 1 {
     return resolve_singular(inp,&tokens[0])
   }
@@ -165,7 +168,7 @@ fn split_tokens(
     // lifts has highest precedence
     if let RawTExpr::Lift(lift) = item {
       let Some(next_item) = tokens.get(index + 1) else {
-        return Err(Box::new(PrecedenceResolutionError))
+        return Err(PrecedenceResolutionError::OrderError)
       };
       match next_item {
         arm@(RawTExpr::And | RawTExpr::Arrow) => {
@@ -176,19 +179,19 @@ fn split_tokens(
           match arm {
             RawTExpr::And => {
               return Ok(
-                PrecedenceResolvedTExpr::DAnd(
-                  rpexpr, Box::new(head), Box::new(tail)))
+                PrecedenceResolvedTExpr::Lift(
+                  LiftKind::And, rpexpr, Box::new(head), Box::new(tail)))
             },
             RawTExpr::Arrow => {
               return Ok(
-                PrecedenceResolvedTExpr::DArrow(
-                  rpexpr, Box::new(head), Box::new(tail)))
+                PrecedenceResolvedTExpr::Lift(
+                  LiftKind::Arrow, rpexpr, Box::new(head), Box::new(tail)))
             },
             _ => unreachable!()
           }
         },
         _ => {
-          return Err(Box::new(PrecedenceResolutionError));
+          return Err(PrecedenceResolutionError::OrderError);
         }
       }
     }
@@ -200,7 +203,10 @@ fn split_tokens(
         (false, false) => {
           let left_part = split_tokens(inp, left_tokens)?;
           let right_part = split_tokens(inp, right_tokens)?;
-          return Ok(PrecedenceResolvedTExpr::Arrow(Box::new(left_part), Box::new(right_part)))
+          let expr = PrecedenceResolvedTExpr::App(
+            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::Arrow)),
+            [left_part, right_part].to_vec());
+          return Ok(expr)
         },
         (true, false) => {
           return resolve_app(inp,tokens)
@@ -208,7 +214,7 @@ fn split_tokens(
         (true, true) => {
           return resolve_singular(inp,item)
         },
-        _ => return Err(Box::new(PrecedenceResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     // then equiv
@@ -219,7 +225,10 @@ fn split_tokens(
         (false, false) => {
           let left_part = split_tokens(inp, left_tokens)?;
           let right_part = split_tokens(inp, right_tokens)?;
-          return Ok(PrecedenceResolvedTExpr::Tilda(Box::new(left_part), Box::new(right_part)))
+          let expr = PrecedenceResolvedTExpr::App(
+            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::Tilda)),
+            [left_part, right_part].to_vec());
+          return Ok(expr)
         },
         (true, false) => {
           return resolve_app(inp,tokens)
@@ -227,7 +236,7 @@ fn split_tokens(
         (true, true) => {
           return resolve_singular(inp, item)
         },
-        _ => return Err(Box::new(PrecedenceResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     // then ors
@@ -238,7 +247,10 @@ fn split_tokens(
         (false, false) => {
           let left_part = split_tokens(inp, left_tokens)?;
           let right_part = split_tokens(inp, right_tokens)?;
-          return Ok(PrecedenceResolvedTExpr::Or(Box::new(left_part), Box::new(right_part)))
+          let expr = PrecedenceResolvedTExpr::App(
+            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::Or)),
+            [left_part, right_part].to_vec());
+          return Ok(expr)
         },
         (true, false) => {
           return resolve_app(inp,tokens)
@@ -246,7 +258,7 @@ fn split_tokens(
         (true, true) => {
           return resolve_singular(inp,item)
         },
-        _ => return Err(Box::new(PrecedenceResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     // then ands
@@ -257,7 +269,10 @@ fn split_tokens(
         (false, false) => {
           let left_part = split_tokens(inp, left_tokens)?;
           let right_part = split_tokens(inp, right_tokens)?;
-          return Ok(PrecedenceResolvedTExpr::And(Box::new(left_part), Box::new(right_part)))
+          let expr = PrecedenceResolvedTExpr::App(
+            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::And)),
+            [left_part, right_part].to_vec());
+          return Ok(expr)
         },
         (true, false) => {
           return resolve_app(inp,tokens)
@@ -265,7 +280,7 @@ fn split_tokens(
         (true, true) => {
           return resolve_singular(inp,item)
         },
-        _ => return Err(Box::new(PrecedenceResolutionError))
+        _ => return Err(PrecedenceResolutionError::OrderError)
       }
     }
     index += 1
@@ -275,10 +290,10 @@ fn split_tokens(
   return resolve_app(inp, tokens)
 }
 fn resolve_app(
-  inp: &String,
+  inp: &[u8],
   tokens: &[RawTExpr]
 ) -> Maybe<PrecedenceResolvedTExpr> {
-  let head = resolve_precendece(inp,&tokens[0])?;
+  let head = resolve_singular(inp,&tokens[0])?;
   let mut args = Vec::new();
   for token in &tokens[1..] {
     let checked = resolve_singular(inp, token)?;
@@ -287,14 +302,18 @@ fn resolve_app(
   return Ok(PrecedenceResolvedTExpr::App(Box::new(head), args));
 }
 fn resolve_singular(
-  inp: &String,
+  inp: &[u8],
   texpr: &RawTExpr
 ) -> Maybe<PrecedenceResolvedTExpr> {
   match texpr {
     RawTExpr::Tuple(l,r) => {
       let l = resolve_singular(inp, l.as_ref())?;
       let r = resolve_singular(inp, r.as_ref())?;
-      return Ok(PrecedenceResolvedTExpr::Tuple(Box::new(l), Box::new(r)))
+      let expr =
+        PrecedenceResolvedTExpr::App(
+          Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::TupleCtor)),
+          [l,r].to_vec());
+      return Ok(expr)
     }
     RawTExpr::TupleCtor => {
       return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::TupleCtor))
@@ -304,19 +323,23 @@ fn resolve_singular(
       match name {
         "inl" => {
           return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Inl));
-        }
+        },
+        "inr" => {
+          return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Inr));
+        },
         _ => return Ok(PrecedenceResolvedTExpr::Ref(*chars))
       }
     },
     RawTExpr::Tokens(tokens) => return split_tokens(inp, tokens),
-    RawTExpr::Lift(_) => return Err(Box::new(PrecedenceResolutionError)),
+    RawTExpr::Lift(_) => return Err(PrecedenceResolutionError::OrderError),
     RawTExpr::Let(let_) => {
       let LetGroup(items, focus) = let_.as_ref();
       let mut items_ = Vec::new();
-      for (pexpr, texpr) in items {
-        let texpr = resolve_precendece(inp,texpr)?;
+      for (pexpr, texpr, oexpr) in items {
         let pexpr = resolve_pexpr(inp, pexpr)?;
-        items_.push((pexpr, texpr));
+        let texpr = resolve_precendece(inp, texpr)?;
+        let oexpr = resolve_precendece(inp,oexpr)?;
+        items_.push((pexpr, texpr, oexpr));
       }
       let focus = resolve_precendece(inp,focus)?;
       return Ok(PrecedenceResolvedTExpr::Let(items_, Box::new(focus)))
@@ -340,7 +363,7 @@ fn resolve_singular(
     RawTExpr::Or => return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Or)),
     RawTExpr::And =>  return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::And)),
     RawTExpr::Pt => return Ok(PrecedenceResolvedTExpr::Pt),
-    RawTExpr::QMark => return Ok(PrecedenceResolvedTExpr::Void),
+    RawTExpr::EMark => return Ok(PrecedenceResolvedTExpr::Void),
   }
 }
 
@@ -351,12 +374,12 @@ fn precedenter_tests() {
     "".to_string() +
     "k : () -> ! = k (->) (-> * *) (* *) (,) (and b) ~ d ({ -> a b => (a,b), (,) a b => a and b } a)"
     ;
-  let mut parser = SourceTextParser::new(&s);
+  let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_top_level_decl();
   match expr {
     Err(err) => println!("{:?}", err),
     Ok(RawDecl(name, tyexpr, oexpr)) => {
-      let pred_tyexpr = resolve_precendece(&parser.chars,&tyexpr);
+      let pred_tyexpr = resolve_precendece(s.as_bytes(),&tyexpr);
       match pred_tyexpr {
         Err(_) => println!("fuck"),
         Ok(expr) => {
@@ -371,14 +394,14 @@ fn precedenter_tests() {
 fn precedenter_tests2() {
   let s =
     "".to_string() +
-    "k : * -> * = { (,) a b, () => a (a,b) }"
+    "k : * -> * = { (,) a b, () => -> a b }"
     ;
-  let mut parser = SourceTextParser::new(&s);
+  let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_top_level_decl();
   match expr {
     Err(err) => println!("{:?}", err),
     Ok(RawDecl(name, tyexpr, oexpr)) => {
-      let pred_tyexpr = resolve_precendece(&parser.chars,&oexpr);
+      let pred_tyexpr = resolve_precendece(s.as_bytes(),&oexpr);
       match pred_tyexpr {
         Err(_) => println!("fuck"),
         Ok(expr) => {
@@ -387,4 +410,66 @@ fn precedenter_tests2() {
       }
     }
   }
+}
+
+#[test] #[ignore]
+fn precedenter_tests3() {
+  let s =
+    "".to_string() +
+    "k : * = (a : * = (->) a => (a : *) -> p a)"
+    ;
+  let mut parser = SourceTextParser::new(s.as_bytes());
+  let expr = parser.parse_top_level_decl();
+  match expr {
+    Err(err) => println!("{:?}", err),
+    Ok(RawDecl(name, tyexpr, oexpr)) => {
+      let pred_tyexpr = resolve_precendece(s.as_bytes(),&oexpr);
+      match pred_tyexpr {
+        Err(_) => println!("fuck"),
+        Ok(expr) => {
+          println!("{:#?}", expr)
+        }
+      }
+    }
+  }
+}
+
+#[test] #[ignore]
+fn precedenter_tests4() {
+  let s =
+    "".to_string() +
+    "N : * = () or N"
+    ;
+  let mut parser = SourceTextParser::new(s.as_bytes());
+  let expr = parser.parse_top_level_decl();
+  match expr {
+    Err(err) => println!("{:?}", err),
+    Ok(RawDecl(name, tyexpr, oexpr)) => {
+      let pred_tyexpr = resolve_precendece(s.as_bytes(),&oexpr);
+      match pred_tyexpr {
+        Err(_) => println!("fuck"),
+        Ok(expr) => {
+          println!("{:#?}", expr)
+        }
+      }
+    }
+  }
+}
+
+#[test] #[ignore]
+fn top_decls() {
+  let mut s =
+    "".to_string() +
+    "N : * = () or N" +
+    ""
+    ;
+  for _ in s.len() .. (s.len().next_multiple_of(size_of::<u8x4>())) {
+    s.push(Letters::EOT as char)
+  }
+  let mut parser = SourceTextParser::new(s.as_bytes());
+  let decl1 = parser.parse_to_end();
+  match decl1 {
+    Ok(val) => println!("{:#?}", val),
+    Err(err) => println!("{:#?}", err),
+}
 }
