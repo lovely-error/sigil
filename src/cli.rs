@@ -2,7 +2,7 @@
 use core::panic;
 use std::{fs::File, path::{Path, self}, io::{Write, Read, self, Stdout, BufWriter, stdout, Stdin, stdin}, str::FromStr, cell::UnsafeCell, net::{TcpListener, TcpStream, SocketAddr, SocketAddrV4}, mem::{transmute_copy, replace, size_of}, sync::mpsc::Receiver, any::Any, simd::u8x4,};
 
-use crate::{driver::{TaskContext, Continuation, WorkGroupRef, WorkGroup}, utils::{with_scoped_consume, PageSource}, mpsc::{MPSCQueue}, garbage, lexer::{SourceTextParser, Letters, RawDecl, ParseFailure}, parser::resolve_precendece, sema::{DeclCheckCtx, ScopedDecl, self, SemanticError}};
+use crate::{driver::{TaskContext, Continuation, WorkGroupRef, WorkGroup}, utils::{with_scoped_consume, PageSource}, mpsc::{MPSCQueue}, garbage, lexer::{SourceTextParser, Letters, RawDecl, ParseFailure}, parser::resolve_precendece, sema::{ScopeCheckCtx, ScopedDecl, self, SemanticError, build_defs}};
 
 
 pub fn main() {
@@ -127,30 +127,4 @@ fn help_message() -> String {
     str.push_str("\n");
   }
   return str
-}
-
-#[derive(Debug)]
-enum SomeError {
-  SemanticErrors(Vec<SemanticError>),
-  ParseError(ParseFailure)
-}
-
-fn build_defs(
-  bytes: &[u8],
-) -> Result<Vec<ScopedDecl>, SomeError>{
-  let mut parser = SourceTextParser::new(bytes);
-  let res = parser.parse_to_end();
-  match res {
-    Ok(defs) => {
-      let mut scchk = DeclCheckCtx::new(bytes);
-      let out = sema::check_decls(&mut scchk, &defs);
-      if let Some(errs) = scchk.get_errors_if_any() {
-        return Err(SomeError::SemanticErrors(errs));
-      }
-      return Ok(out);
-    },
-    Err(err) => {
-      return Err(SomeError::ParseError(err));
-    },
-  }
 }

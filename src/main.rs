@@ -2,7 +2,9 @@
 #![feature(exact_size_is_empty)]
 #![feature(absolute_path)]
 #![feature(trait_upcasting)]
-
+#![feature(try_trait_v2)]
+#![feature(get_mut_unchecked)]
+#![feature(strict_provenance)]
 mod root_alloc;
 mod utils;
 mod loopbuffer;
@@ -26,7 +28,7 @@ mod parser;
 
 mod interlacing_alloc;
 
-mod reductor;
+mod checker;
 
 
 

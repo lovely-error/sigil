@@ -1,46 +1,47 @@
-use std::{any::Any, mem::size_of, simd::u8x4};
+use std::{any::Any, mem::size_of, simd::u8x4, collections::HashMap};
 
-use crate::{lexer::{CharsData, RawPExpr, RawTExpr, Lift, LetGroup, Lambda, Clause, SourceTextParser, RawDecl, Letters}, root_alloc::RootAllocator, sema::get_name};
+use crate::{lexer::{CharsData, RawPExpr, RawTExpr, Lift, LetGroup, Lambda, Clause, SourceTextParser, RawDecl, Letters, pad_string, InfixOp}, root_alloc::RootAllocator, sema::get_name};
 
 
 
 #[derive(Debug, Clone)]
 pub enum RefinedPExpr {
   Discard,
-  Ref(CharsData),
-  AtomRef(AtomRef),
-  Group(Box<Self>, Vec<Self>),
+  Binder(CharsData),
+  Group(Atom, Vec<Self>),
   Pt
 }
 #[derive(Debug, Clone, Copy)]
-pub enum PrecedenceResolutionError {
-  OrderError
+pub enum PrecedenceResolutionFailure {
+  OrderError, InfixOpSplitFailed
 }
-
-type Maybe<R> = Result<R, PrecedenceResolutionError>;
-fn resolve_pexpr(inp: &[u8], pexpr: &RawPExpr) -> Maybe<RefinedPExpr> {
+type Maybe<R> = Result<R, PrecedenceResolutionFailure>;
+fn resolve_pexpr(
+  inp: &[u8],
+  pexpr: &RawPExpr,
+) -> Maybe<RefinedPExpr> {
   match pexpr {
-    RawPExpr::HeadTuple => Ok(RefinedPExpr::AtomRef(AtomRef::TupleCtor)),
     RawPExpr::Tuple(l, r) => {
       let l = resolve_pexpr(inp, l)?;
       let r = resolve_pexpr(inp, r)?;
       let expr = RefinedPExpr::Group(
-        Box::new(RefinedPExpr::AtomRef(AtomRef::TupleCtor)),
+        Atom::TupleCtor,
         [l,r].to_vec());
       return Ok(expr)
     },
     RawPExpr::Discard => Ok(RefinedPExpr::Discard),
     RawPExpr::Chars(chars) => {
-      Ok(RefinedPExpr::Ref(*chars))
+      Ok(RefinedPExpr::Binder(*chars))
     },
     RawPExpr::Seqv(toks) => {
       return resolve_pexprs(inp, toks)
     },
-    RawPExpr::Arrow => Ok(RefinedPExpr::AtomRef(AtomRef::Arrow)),
-    RawPExpr::Tilda => Ok(RefinedPExpr::AtomRef(AtomRef::Tilda)),
-    RawPExpr::Or => Ok(RefinedPExpr::AtomRef(AtomRef::Or)),
-    RawPExpr::And => Ok(RefinedPExpr::AtomRef(AtomRef::And)),
     RawPExpr::Pt => Ok(RefinedPExpr::Pt),
+    RawPExpr::HeadTuple |
+    RawPExpr::Arrow |
+    RawPExpr::Tilda |
+    RawPExpr::Or |
+    RawPExpr::And => return Err(PrecedenceResolutionFailure::OrderError),
   }
 }
 fn resolve_pexprs(inp: &[u8], pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
@@ -58,11 +59,11 @@ fn resolve_pexprs(inp: &[u8], pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
           let expr = RefinedPExpr::Group(
-            Box::new(RefinedPExpr::AtomRef(AtomRef::Arrow)),
+            Atom::Arrow,
             [left, right].to_vec());
           return Ok(expr)
         },
-        _ => return Err(PrecedenceResolutionError::OrderError)
+        _ => return Err(PrecedenceResolutionFailure::OrderError)
       }
     }
     if let RawPExpr::Tilda = item {
@@ -74,11 +75,11 @@ fn resolve_pexprs(inp: &[u8], pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
           let expr = RefinedPExpr::Group(
-            Box::new(RefinedPExpr::AtomRef(AtomRef::Tilda)),
+            Atom::Tilda,
             [left, right].to_vec());
           return Ok(expr)
         },
-        _ => return Err(PrecedenceResolutionError::OrderError)
+        _ => return Err(PrecedenceResolutionFailure::OrderError)
       }
     }
     if let RawPExpr::Or = item {
@@ -90,11 +91,11 @@ fn resolve_pexprs(inp: &[u8], pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
           let expr = RefinedPExpr::Group(
-            Box::new(RefinedPExpr::AtomRef(AtomRef::Or)),
+            Atom::Or,
             [left, right].to_vec());
           return Ok(expr)
         },
-        _ => return Err(PrecedenceResolutionError::OrderError)
+        _ => return Err(PrecedenceResolutionFailure::OrderError)
       }
     }
     if let RawPExpr::And = item {
@@ -106,11 +107,11 @@ fn resolve_pexprs(inp: &[u8], pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
           let left = resolve_pexprs(inp, left)?;
           let right = resolve_pexprs(inp, right)?;
           let expr = RefinedPExpr::Group(
-            Box::new(RefinedPExpr::AtomRef(AtomRef::And)),
+            Atom::And,
             [left, right].to_vec());
           return Ok(expr)
         },
-        _ => return Err(PrecedenceResolutionError::OrderError)
+        _ => return Err(PrecedenceResolutionFailure::OrderError)
       }
     }
     ix += 1;
@@ -118,14 +119,30 @@ fn resolve_pexprs(inp: &[u8], pexprs:&[RawPExpr]) -> Maybe<RefinedPExpr> {
   return resolve_app_pexpr(inp, pexprs)
 }
 fn resolve_app_pexpr(inp: &[u8], pexpr: &[RawPExpr]) -> Maybe<RefinedPExpr> {
-  let head = resolve_pexpr(inp, &pexpr[0])?;
   let mut args = Vec::new();
   for item in &pexpr[1..] {
     args.push(resolve_pexpr(inp, item)?)
   }
-  return Ok(RefinedPExpr::Group(Box::new(head), args))
+  let head = &pexpr[0];
+  let head = match head {
+    RawPExpr::Arrow => Atom::Arrow,
+    RawPExpr::Tilda => Atom::Tilda,
+    RawPExpr::Or => Atom::Or,
+    RawPExpr::And => Atom::And,
+    RawPExpr::HeadTuple => Atom::TupleCtor,
+    RawPExpr::Chars(cd) => {
+      let name = get_name(inp, cd);
+      match name {
+        "inl" => Atom::Inl,
+        "inr" => Atom::Inr,
+        _ => return Err(PrecedenceResolutionFailure::OrderError)
+      }
+    },
+    _ => return Err(PrecedenceResolutionFailure::OrderError)
+  };
+  return Ok(RefinedPExpr::Group(head, args))
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LiftKind {
   Arrow, And
 }
@@ -133,7 +150,7 @@ pub enum LiftKind {
 pub enum PrecedenceResolvedTExpr {
   App(Box<Self>, Vec<Self>),
   Ref(CharsData),
-  AtomRef(AtomRef),
+  AtomRef(Atom),
   Lift(LiftKind, RefinedPExpr, Box<Self>, Box<Self>),
   Star,
   Let(Vec<(RefinedPExpr, Self, Self)>, Box<Self>),
@@ -141,8 +158,21 @@ pub enum PrecedenceResolvedTExpr {
   Pt,
   Void,
 }
-#[derive(Debug, Clone, Copy)]
-pub enum AtomRef { And, Or, Arrow, Tilda, TupleCtor, Inl, Inr }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Atom { And, Or, Arrow, Tilda, TupleCtor, Inl, Inr }
+impl Atom {
+  pub fn arg_limit(&self) -> usize {
+    match self {
+        Atom::And |
+        Atom::Or |
+        Atom::Arrow |
+        Atom::Tilda |
+        Atom::TupleCtor => 2,
+        Atom::Inl |
+        Atom::Inr => 1,
+      }
+  }
+}
 
 pub fn resolve_precendece(
   inp: &[u8],
@@ -157,137 +187,98 @@ fn split_tokens(
 ) -> Maybe<PrecedenceResolvedTExpr> {
   let end_index = tokens.len();
   if end_index == 0 {
-    return Err(PrecedenceResolutionError::OrderError);
+    return Err(PrecedenceResolutionFailure::OrderError);
   }
   if end_index == 1 {
     return resolve_singular(inp,&tokens[0])
   }
   let mut index = 0;
-  while index != end_index {
-    let item = &tokens[index];
-    // lifts has highest precedence
-    if let RawTExpr::Lift(lift) = item {
+  let item = tokens.get(index);
+  loop {
+    if let RawTExpr::Lift(lift) = item.unwrap() {
+      let Lift(pexpr, texpr) = lift.as_ref();
+      let head = resolve_precendece(inp, texpr)?;
+      let tail = split_tokens(inp, &tokens[index + 2 ..])?;
+      let rpexpr = resolve_pexpr(inp, pexpr)?;
       let Some(next_item) = tokens.get(index + 1) else {
-        return Err(PrecedenceResolutionError::OrderError)
+        return Err(PrecedenceResolutionFailure::OrderError)
       };
       match next_item {
-        arm@(RawTExpr::And | RawTExpr::Arrow) => {
-          let Lift(pexpr, texpr) = lift.as_ref();
-          let head = resolve_precendece(inp, texpr)?;
-          let tail = split_tokens(inp, &tokens[index + 2 ..])?;
-          let rpexpr = resolve_pexpr(inp, pexpr)?;
-          match arm {
-            RawTExpr::And => {
-              return Ok(
-                PrecedenceResolvedTExpr::Lift(
-                  LiftKind::And, rpexpr, Box::new(head), Box::new(tail)))
-            },
-            RawTExpr::Arrow => {
-              return Ok(
-                PrecedenceResolvedTExpr::Lift(
-                  LiftKind::Arrow, rpexpr, Box::new(head), Box::new(tail)))
-            },
-            _ => unreachable!()
+        RawTExpr::InfixOp(infop) => {
+          match infop {
+            InfixOp::And => return Ok(
+              PrecedenceResolvedTExpr::Lift(
+                LiftKind::And, rpexpr, Box::new(head), Box::new(tail))),
+            InfixOp::Arrow => return Ok(
+              PrecedenceResolvedTExpr::Lift(
+                LiftKind::Arrow, rpexpr, Box::new(head), Box::new(tail))),
+            InfixOp::Or |
+            InfixOp::Tilda => return Err(PrecedenceResolutionFailure::OrderError),
           }
         },
         _ => {
-          return Err(PrecedenceResolutionError::OrderError);
+          return Err(PrecedenceResolutionFailure::OrderError);
         }
       }
     }
-    // then go regular arrows
-    if let RawTExpr::Arrow = item {
-      let left_tokens = &tokens[..index];
-      let right_tokens = &tokens[index + 1 ..];
-      match (left_tokens.is_empty(), right_tokens.is_empty()) {
-        (false, false) => {
-          let left_part = split_tokens(inp, left_tokens)?;
-          let right_part = split_tokens(inp, right_tokens)?;
-          let expr = PrecedenceResolvedTExpr::App(
-            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::Arrow)),
-            [left_part, right_part].to_vec());
-          return Ok(expr)
-        },
-        (true, false) => {
-          return resolve_app(inp,tokens)
-        },
-        (true, true) => {
-          return resolve_singular(inp,item)
-        },
-        _ => return Err(PrecedenceResolutionError::OrderError)
-      }
-    }
-    // then equiv
-    if let RawTExpr::Tilda = item {
-      let left_tokens = &tokens[..index];
-      let right_tokens = &tokens[index + 1 ..];
-      match (left_tokens.is_empty(), right_tokens.is_empty()) {
-        (false, false) => {
-          let left_part = split_tokens(inp, left_tokens)?;
-          let right_part = split_tokens(inp, right_tokens)?;
-          let expr = PrecedenceResolvedTExpr::App(
-            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::Tilda)),
-            [left_part, right_part].to_vec());
-          return Ok(expr)
-        },
-        (true, false) => {
-          return resolve_app(inp,tokens)
-        },
-        (true, true) => {
-          return resolve_singular(inp, item)
-        },
-        _ => return Err(PrecedenceResolutionError::OrderError)
-      }
-    }
-    // then ors
-    if let RawTExpr::Or = item {
-      let left_tokens = &tokens[..index];
-      let right_tokens = &tokens[index + 1 ..];
-      match (left_tokens.is_empty(), right_tokens.is_empty()) {
-        (false, false) => {
-          let left_part = split_tokens(inp, left_tokens)?;
-          let right_part = split_tokens(inp, right_tokens)?;
-          let expr = PrecedenceResolvedTExpr::App(
-            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::Or)),
-            [left_part, right_part].to_vec());
-          return Ok(expr)
-        },
-        (true, false) => {
-          return resolve_app(inp,tokens)
-        },
-        (true, true) => {
-          return resolve_singular(inp,item)
-        },
-        _ => return Err(PrecedenceResolutionError::OrderError)
-      }
-    }
-    // then ands
-    if let RawTExpr::And = item {
-      let left_tokens = &tokens[..index];
-      let right_tokens = &tokens[index + 1 ..];
-      match (left_tokens.is_empty(), right_tokens.is_empty()) {
-        (false, false) => {
-          let left_part = split_tokens(inp, left_tokens)?;
-          let right_part = split_tokens(inp, right_tokens)?;
-          let expr = PrecedenceResolvedTExpr::App(
-            Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::And)),
-            [left_part, right_part].to_vec());
-          return Ok(expr)
-        },
-        (true, false) => {
-          return resolve_app(inp,tokens)
-        },
-        (true, true) => {
-          return resolve_singular(inp,item)
-        },
-        _ => return Err(PrecedenceResolutionError::OrderError)
-      }
-    }
-    index += 1
+    index += 1;
+    if index == end_index { break }
   }
+  for op in [
+    (InfixOp::Arrow, Atom::Arrow),
+    (InfixOp::Or, Atom::Or),
+    (InfixOp::And, Atom::And),
+    (InfixOp::Tilda, Atom::Tilda),
+  ] {
+    let outcome = traverse_token_seqv(inp, op.0, op.1, tokens);
+    match &outcome {
+      Ok(_) => return outcome,
+      Err(err) => {
+        match err {
+          PrecedenceResolutionFailure::OrderError => return outcome,
+          PrecedenceResolutionFailure::InfixOpSplitFailed => (),
+        }
+      },
+    }
+  };
   // the computation should have diverged by this point if it has matched any builtins operators.
   // if it didnt then this tokens seqv is an application
   return resolve_app(inp, tokens)
+}
+fn traverse_token_seqv(
+  inp: &[u8],
+  infop: InfixOp,
+  atom: Atom,
+  tokens: &[RawTExpr],
+) -> Maybe<PrecedenceResolvedTExpr> {
+  let mut pivot_index = 0;
+  loop {
+    let Some(item) = tokens.get(pivot_index) else { break };
+    if let RawTExpr::InfixOp(infop_) = item {
+      if *infop_ != infop { pivot_index += 1; continue; }
+      let left_tokens = &tokens[.. pivot_index];
+      let right_tokens = &tokens[pivot_index + 1 ..];
+      match (left_tokens.is_empty(), right_tokens.is_empty()) {
+        (false, false) => {
+          let left_part = split_tokens(inp, left_tokens)?;
+          let right_part = split_tokens(inp, right_tokens)?;
+          let expr = PrecedenceResolvedTExpr::App(
+            Box::new(PrecedenceResolvedTExpr::AtomRef(atom)),
+            [left_part, right_part].to_vec());
+          return Ok(expr)
+        },
+        (true, false) => {
+          return resolve_app(inp,tokens)
+        },
+        (true, true) => {
+          return resolve_singular(inp,item)
+        },
+        _ => return Err(PrecedenceResolutionFailure::OrderError)
+      }
+    }
+    pivot_index += 1;
+  };
+  return Err(PrecedenceResolutionFailure::InfixOpSplitFailed);
 }
 fn resolve_app(
   inp: &[u8],
@@ -311,27 +302,27 @@ fn resolve_singular(
       let r = resolve_singular(inp, r.as_ref())?;
       let expr =
         PrecedenceResolvedTExpr::App(
-          Box::new(PrecedenceResolvedTExpr::AtomRef(AtomRef::TupleCtor)),
+          Box::new(PrecedenceResolvedTExpr::AtomRef(Atom::TupleCtor)),
           [l,r].to_vec());
       return Ok(expr)
     }
     RawTExpr::TupleCtor => {
-      return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::TupleCtor))
+      return Ok(PrecedenceResolvedTExpr::AtomRef(Atom::TupleCtor))
     }
     RawTExpr::Chars(chars) => {
       let name = get_name(inp, chars);
       match name {
         "inl" => {
-          return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Inl));
+          return Ok(PrecedenceResolvedTExpr::AtomRef(Atom::Inl));
         },
         "inr" => {
-          return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Inr));
+          return Ok(PrecedenceResolvedTExpr::AtomRef(Atom::Inr));
         },
         _ => return Ok(PrecedenceResolvedTExpr::Ref(*chars))
       }
     },
     RawTExpr::Tokens(tokens) => return split_tokens(inp, tokens),
-    RawTExpr::Lift(_) => return Err(PrecedenceResolutionError::OrderError),
+    RawTExpr::Lift(_) => return Err(PrecedenceResolutionFailure::OrderError),
     RawTExpr::Let(let_) => {
       let LetGroup(items, focus) = let_.as_ref();
       let mut items_ = Vec::new();
@@ -357,11 +348,16 @@ fn resolve_singular(
       }
       return Ok(PrecedenceResolvedTExpr::Lambda(vec))
     },
-    RawTExpr::Arrow => return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Arrow)),
-    RawTExpr::Tilda => return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Tilda)),
+    RawTExpr::InfixOp(infop) => {
+      let atom = match infop {
+        InfixOp::Arrow => Atom::Arrow,
+        InfixOp::And => Atom::And,
+        InfixOp::Or => Atom::Or,
+        InfixOp::Tilda => Atom::Tilda,
+      };
+      return Ok(PrecedenceResolvedTExpr::AtomRef(atom));
+    },
     RawTExpr::Star => return Ok(PrecedenceResolvedTExpr::Star),
-    RawTExpr::Or => return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::Or)),
-    RawTExpr::And =>  return Ok(PrecedenceResolvedTExpr::AtomRef(AtomRef::And)),
     RawTExpr::Pt => return Ok(PrecedenceResolvedTExpr::Pt),
     RawTExpr::EMark => return Ok(PrecedenceResolvedTExpr::Void),
   }
@@ -370,10 +366,11 @@ fn resolve_singular(
 
 #[test] #[ignore]
 fn precedenter_tests() {
-  let s =
+  let mut s =
     "".to_string() +
     "k : () -> ! = k (->) (-> * *) (* *) (,) (and b) ~ d ({ -> a b => (a,b), (,) a b => a and b } a)"
     ;
+  pad_string(&mut s);
   let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_top_level_decl();
   match expr {
@@ -392,10 +389,11 @@ fn precedenter_tests() {
 
 #[test] #[ignore]
 fn precedenter_tests2() {
-  let s =
+  let mut s =
     "".to_string() +
     "k : * -> * = { (,) a b, () => -> a b }"
     ;
+  pad_string(&mut s);
   let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_top_level_decl();
   match expr {
@@ -414,10 +412,11 @@ fn precedenter_tests2() {
 
 #[test] #[ignore]
 fn precedenter_tests3() {
-  let s =
+  let mut s =
     "".to_string() +
     "k : * = (a : * = (->) a => (a : *) -> p a)"
     ;
+  pad_string(&mut s);
   let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_top_level_decl();
   match expr {
@@ -436,10 +435,11 @@ fn precedenter_tests3() {
 
 #[test] #[ignore]
 fn precedenter_tests4() {
-  let s =
+  let mut s =
     "".to_string() +
-    "N : * = () or N"
+    "T : * = ((and) *) T"
     ;
+  pad_string(&mut s);
   let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_top_level_decl();
   match expr {
@@ -455,21 +455,25 @@ fn precedenter_tests4() {
     }
   }
 }
-
 #[test] #[ignore]
-fn top_decls() {
+fn precedenter_tests5() {
   let mut s =
     "".to_string() +
-    "N : * = () or N" +
-    ""
+    "d : * = (T:*) -> (K:*) -> T and K or ()"
     ;
-  for _ in s.len() .. (s.len().next_multiple_of(size_of::<u8x4>())) {
-    s.push(Letters::EOT as char)
-  }
+  pad_string(&mut s);
   let mut parser = SourceTextParser::new(s.as_bytes());
-  let decl1 = parser.parse_to_end();
-  match decl1 {
-    Ok(val) => println!("{:#?}", val),
-    Err(err) => println!("{:#?}", err),
-}
+  let expr = parser.parse_top_level_decl();
+  match expr {
+    Err(err) => println!("{:?}", err),
+    Ok(RawDecl(name, tyexpr, oexpr)) => {
+      let pred_tyexpr = resolve_precendece(s.as_bytes(),&oexpr);
+      match pred_tyexpr {
+        Err(_) => println!("fuck"),
+        Ok(expr) => {
+          println!("{:#?}", expr)
+        }
+      }
+    }
+  }
 }

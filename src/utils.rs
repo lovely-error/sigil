@@ -259,3 +259,101 @@ trait ExposesTraversableContiguosMemory {
 pub trait SomeDebug: Any + std::fmt::Debug + Clone {}
 type __ = Box<dyn SomeDebug>;
 
+pub enum Outcome<R, E> {
+  OneErr(E),
+  ManyErrs(Vec<E>),
+  Result(R)
+}
+impl<E, R1> Outcome<R1, E> {
+  pub fn and<R2>(self, another: Outcome<R2, E>) -> Outcome<(R1, R2), E> {
+    match (self, another) {
+      (Outcome::OneErr(a), Outcome::OneErr(b)) => Outcome::ManyErrs(vec![a,b]),
+      (Outcome::ManyErrs(mut errs), Outcome::OneErr(err)) |
+      (Outcome::OneErr(err), Outcome::ManyErrs(mut errs)) => {
+        errs.push(err);
+        Outcome::ManyErrs(errs)
+      },
+      (Outcome::Result(_), Outcome::OneErr(err)) |
+      (Outcome::OneErr(err), Outcome::Result(_)) => {
+        Outcome::OneErr(err)
+      },
+      (Outcome::ManyErrs(mut errs), Outcome::ManyErrs(mut errs_)) => {
+        errs.append(&mut errs_);
+        Outcome::ManyErrs(errs)
+      },
+      (Outcome::ManyErrs(errs), Outcome::Result(_)) |
+      (Outcome::Result(_), Outcome::ManyErrs(errs)) => Outcome::ManyErrs(errs),
+      (Outcome::Result(l), Outcome::Result(r)) => {
+        Outcome::Result((l,r))
+      },
+    }
+  }
+}
+
+impl<T, R> From<Outcome<R, T>> for Vec<T> {
+  fn from(value: Outcome<R, T>) -> Self {
+      match value {
+        Outcome::OneErr(err) => vec![err],
+        Outcome::ManyErrs(errs) => errs,
+        Outcome::Result(_) => vec![],
+    }
+  }
+}
+impl<E, R> core::ops::FromResidual for Outcome<E, R> {
+  fn from_residual(residual: <Self as std::ops::Try>::Residual) -> Self {
+      Outcome::ManyErrs(residual)
+  }
+}
+impl<E, R> core::ops::Try for Outcome<R, E> {
+  type Output = R;
+  type Residual = Vec<E>;
+  fn branch(self) -> std::ops::ControlFlow<Self::Residual, Self::Output> {
+    match self {
+      Outcome::OneErr(err) => std::ops::ControlFlow::Break(vec!(err)),
+      Outcome::ManyErrs(errs) => std::ops::ControlFlow::Break(errs),
+      Outcome::Result(v) => std::ops::ControlFlow::Continue(v),
+    }
+  }
+  fn from_output(output: Self::Output) -> Self {
+    Outcome::Result(output)
+  }
+}
+impl<E, R> Into<Result<R, Vec<E>>> for Outcome<R, E> {
+  fn into(self) -> Result<R, Vec<E>> {
+    match self {
+      Outcome::OneErr(err) => Err(vec![err]),
+      Outcome::ManyErrs(errs) => Err(errs),
+      Outcome::Result(val) => Ok(val),
+    }
+  }
+}
+
+pub fn inside_out<R:Clone, E:Clone>(inp: &Vec<Outcome<R, E>>) -> Outcome<Vec<R>, E> {
+  let mut results = Vec::new();
+  let mut errors = Vec::new();
+  let mut in_fail_mode = false;
+  for item in inp {
+    match item {
+      Outcome::OneErr(err) => {
+        in_fail_mode = true;
+        errors.push(err.clone());
+      },
+      Outcome::ManyErrs(errs) => {
+        in_fail_mode = true;
+        for ierr in errs {
+          errors.push(ierr.clone())
+        }
+      },
+      Outcome::Result(val) => {
+        if !in_fail_mode {
+          results.push(val.clone())
+        }
+      },
+    }
+  }
+  if in_fail_mode {
+    return Outcome::ManyErrs(errors);
+  } else {
+    return Outcome::Result(results);
+  }
+}

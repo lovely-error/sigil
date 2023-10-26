@@ -30,23 +30,29 @@ impl Letters {
   pub const TILDA: u8 = '~' as u8;
   pub const EMARK: u8 = '!' as u8;
   pub const SEMICOLON : u8 = ';' as u8;
+  pub const ZERO : u8 = 48 ;
+  pub const NINE : u8 = 57;
 }
 
+pub fn pad_string(str:&mut String) {
+  for _ in str.len() .. (str.len().next_multiple_of(size_of::<u8x4>())) {
+    str.push(Letters::EOT as char);
+  }
+}
 
 #[derive(Clone, Copy)]
 struct ParseState {
   current_char_ptr:*const u8,
-  decl_end: *const u8
 }
 pub struct SourceTextParser<'i> {
   pub chars: &'i [u8],
   state:ParseState,
-
+  end_ptr: *const u8
 }
-#[derive(Debug, Clone, Copy)]
-enum InfixOp { Arrow, And, Or, Tilda }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InfixOp { Arrow, And, Or, Tilda }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ParseFailure;
 pub type Maybe<T> = Result<T, ParseFailure>;
 impl <'i> SourceTextParser<'i> {
@@ -57,15 +63,23 @@ impl <'i> SourceTextParser<'i> {
     if len % size_of::<u8x4>() != 0 {
       panic!("unpadded data")
     }
-    let start = chars.as_ptr();
-    let end = unsafe{start.add(len)};
+    let start_ptr = chars.as_ptr();
     Self {
       chars:chars,
       state:ParseState {
-        current_char_ptr: start,
-        decl_end: end
+        current_char_ptr: start_ptr,
       },
+      end_ptr: unsafe{start_ptr.add(len)}
     }
+  }
+  fn no_more_chars(&self) -> bool {
+    if self.state.current_char_ptr == self.end_ptr {
+      return true
+    }
+    if self.current_char() == Letters::EOT {
+      return true
+    }
+    return false;
   }
   fn checkpoint(&self) -> ParseState {
     self.state
@@ -74,9 +88,6 @@ impl <'i> SourceTextParser<'i> {
     self.state = state;
   }
   fn current_char(&self) -> u8 {
-    if self.state.current_char_ptr >= self.state.decl_end {
-      return Letters::EOT
-    }
     unsafe { *self.state.current_char_ptr }
   }
   fn skip(&mut self, count: u8) {
@@ -87,10 +98,9 @@ impl <'i> SourceTextParser<'i> {
     let delimiters = u8x4::from_array([
       Letters::Whitespace, Letters::NewLine, 0, 0
     ]);
-    let end_ptr = self.state.decl_end;
     let mut char_ptr = self.state.current_char_ptr;
     loop {
-      if char_ptr >= end_ptr { break; }
+      if self.no_more_chars() { return; }
       let char = *char_ptr;
       let mask = u8x4::splat(char).simd_eq(delimiters);
       if !mask.any() { break }
@@ -122,67 +132,64 @@ impl <'i> SourceTextParser<'i> {
     self.skip(skip);
     return Some(infix)
   }; }
-  fn probe_depth(&mut self) -> u32 { unsafe {
-    let mut char_ptr = self.state.current_char_ptr;
-    let mut current_depth = 0;
-    let end_ptr = self.state.decl_end;
-    let mut encountered_newline = false;
-    let mut slow_iters_until_aligned = char_ptr.align_offset(align_of::<u8x4>());
-    'outer:loop {
-      loop {
-        if char_ptr >= end_ptr { break 'outer }
-        if slow_iters_until_aligned == 0 { break }
-        let byte = *char_ptr;
-        match byte {
-          Letters::NewLine => {
-            current_depth = 0;
-            encountered_newline = true;
-          },
-          Letters::Whitespace => current_depth += 1,
-          _ => break 'outer
-        }
-        char_ptr = char_ptr.add(1);
-        slow_iters_until_aligned -= 1;
-      }
-      loop {
-        if char_ptr >= end_ptr { break 'outer }
-        let quad = *char_ptr.cast::<u8x4>();
-        let ws_matches = quad.simd_eq(Simd::splat(Letters::Whitespace));
-        if ws_matches != Mask::splat(true) {
-          // we have encountered something other than whispace
-          let remaining =
-            transmute::<_, u32>(ws_matches)
-            .trailing_ones()
-            >> 3;
-          current_depth += remaining;
-          char_ptr = char_ptr.add(remaining as usize);
+  // fn probe_depth(&mut self) -> u32 { unsafe {
+  //   let mut char_ptr = self.state.current_char_ptr;
+  //   let mut current_depth = 0;
+  //   let mut encountered_newline = false;
+  //   let mut slow_iters_until_aligned = char_ptr.align_offset(align_of::<u8x4>());
+  //   'outer:loop {
+  //     loop {
+  //       if self.no_more_chars() { break 'outer }
+  //       if slow_iters_until_aligned == 0 { break }
+  //       let byte = *char_ptr;
+  //       match byte {
+  //         Letters::NewLine => {
+  //           current_depth = 0;
+  //           encountered_newline = true;
+  //         },
+  //         Letters::Whitespace => current_depth += 1,
+  //         _ => break 'outer
+  //       }
+  //       char_ptr = char_ptr.add(1);
+  //       slow_iters_until_aligned -= 1;
+  //     }
+  //     loop {
+  //       if self.no_more_chars() { break 'outer }
+  //       let quad = *char_ptr.cast::<u8x4>();
+  //       let ws_matches = quad.simd_eq(Simd::splat(Letters::Whitespace));
+  //       if ws_matches != Mask::splat(true) {
+  //         // we have encountered something other than whispace
+  //         let remaining =
+  //           transmute::<_, u32>(ws_matches)
+  //           .trailing_ones()
+  //           >> 3;
+  //         current_depth += remaining;
+  //         char_ptr = char_ptr.add(remaining as usize);
 
-          if *char_ptr == Letters::NewLine {
-            encountered_newline = true;
-            current_depth = 0;
-            char_ptr = char_ptr.add(1);
-            slow_iters_until_aligned = char_ptr.align_offset(align_of::<u8x4>());
-            continue 'outer;
-          }
-
-          break 'outer
-        }
-        // just four whitespaces. align is okay
-        current_depth += 4;
-        char_ptr = char_ptr.add(4);
-      }
-    }
-    self.state.current_char_ptr = char_ptr;
-    return if encountered_newline { current_depth } else { 0 }
-  } }
+  //         if *char_ptr == Letters::NewLine {
+  //           encountered_newline = true;
+  //           current_depth = 0;
+  //           char_ptr = char_ptr.add(1);
+  //           slow_iters_until_aligned = char_ptr.align_offset(align_of::<u8x4>());
+  //           continue 'outer;
+  //         }
+  //         break 'outer
+  //       }
+  //       // just four whitespaces. align is okay
+  //       current_depth += 4;
+  //       char_ptr = char_ptr.add(4);
+  //     }
+  //   }
+  //   self.state.current_char_ptr = char_ptr;
+  //   return if encountered_newline { current_depth } else { 0 }
+  // } }
   fn parse_identifier(&mut self) -> Option<CharsData> { unsafe {
-    let end_ptr = self.state.decl_end;
     let start_ptr = self.state.current_char_ptr;
     let mut char_ptr = start_ptr;
     let mut slow_iters_until_aligned = char_ptr.align_offset(align_of::<u8x4>());
     'main:loop {
       'slow:loop {
-        if char_ptr >= end_ptr { break 'main }
+        if self.no_more_chars() { break 'main }
         if slow_iters_until_aligned == 0 { break 'slow }
         let byte = *char_ptr;
         let ok =
@@ -190,49 +197,44 @@ impl <'i> SourceTextParser<'i> {
           byte <= Letters::z ||
           byte >= Letters::A &&
           byte <= Letters::Z ||
+          byte >= Letters::ZERO &&
+          byte <= Letters::NINE ||
           byte == Letters::Underscore ;
         if !ok { break 'main }
         char_ptr = char_ptr.add(1);
         slow_iters_until_aligned -= 1;
       }
-      let mut char_ptr_ = char_ptr;
-      loop {
-        // the code bellow relies on the fact that
-        // A > a && A > z
-        // this is fragile as f
-        let quad = *char_ptr_.cast::<u8x4>();
-        let mut outcomes = Mask::splat(false);
-        outcomes |= quad.simd_le(Simd::splat(Letters::z));
-        outcomes &= quad.simd_ge(Simd::splat(Letters::a));
-        outcomes |= quad.simd_eq(Simd::splat(Letters::Underscore));
-        let resolved = Mask::splat(true);
-        if outcomes == resolved {
-          char_ptr_ = char_ptr_.add(4);
-          if char_ptr_ >= end_ptr { break }
-          continue
+      'fast:loop {
+        let quad = *char_ptr.cast::<u8x4>();
+        let mut check1 = Mask::splat(false);
+        check1 |= quad.simd_le(Simd::splat(Letters::z));
+        check1 &= quad.simd_ge(Simd::splat(Letters::a));
+        let mut check2 = Mask::splat(false);
+        check2 |= quad.simd_le(Simd::splat(Letters::Z));
+        check2 &= quad.simd_ge(Simd::splat(Letters::A));
+        let mut check3 = Mask::splat(false);
+        check3 |= quad.simd_le(Simd::splat(Letters::NINE));
+        check3 &= quad.simd_ge(Simd::splat(Letters::ZERO));
+        let outcome =
+          check1 | check2 | check3 | quad.simd_eq(Simd::splat(Letters::Underscore));
+        if outcome == Mask::splat(true) {
+          char_ptr = char_ptr.add(4);
+          continue 'fast
         }
-        outcomes |= quad.simd_le(Simd::splat(Letters::Z));
-        outcomes &= quad.simd_ge(Simd::splat(Letters::A));
-        outcomes |= quad.simd_eq(Simd::splat(Letters::Underscore));
-        if outcomes == resolved {
-          char_ptr_ = char_ptr_.add(4);
-          if char_ptr_ >= end_ptr { break }
-          continue
+        let mut remainder = 0 ;
+        for i in outcome.to_array() {
+          if i { remainder += 1 } else { break }
         }
-        // we have encountered some chars which are not
-        // valid for an identifier
-        let excess = (transmute::<_, u32>(outcomes).trailing_ones() >> 3) as usize;
-        char_ptr = char_ptr_.add(excess);
+        char_ptr = char_ptr.add(remainder);
         break 'main;
       }
-      char_ptr = char_ptr_;
     }
     self.state.current_char_ptr = char_ptr;
     let offset_from_head = (char_ptr as usize - start_ptr as usize) as u16;
     let empty_ident = offset_from_head == 0;
     if empty_ident { return None }
     let offset_from_start = (start_ptr as usize - self.chars.as_ptr() as usize) as u32;
-    let result = CharsData { offset_from_head, offset_from_start };
+    let result = CharsData { off2: offset_from_head, off1: offset_from_start };
     return Some(result)
   }; }
   fn parse_pattern_expr(
@@ -440,20 +442,10 @@ impl <'i> SourceTextParser<'i> {
         }
         _ => {
           if let Some(infix) = self.parse_infix_op() {
-            let infix = match infix {
-              InfixOp::Arrow => RawTExpr::Arrow,
-              InfixOp::And => RawTExpr::And,
-              InfixOp::Or => RawTExpr::Or,
-              InfixOp::Tilda => RawTExpr::Tilda
-            };
-            components.push(infix);
+            let node = RawTExpr::InfixOp(infix);
+            components.push(node);
             continue;
           }
-          let chkpt = self.checkpoint();
-          if let Ok(let_) = self.parse_let() {
-            components.push(RawTExpr::Let(Box::new(let_)));
-            continue;
-          } else { self.backtrack(chkpt) }
           if let Some(chars) = self.parse_identifier() {
             components.push(RawTExpr::Chars(chars));
             continue;
@@ -505,9 +497,6 @@ impl <'i> SourceTextParser<'i> {
     let tail_expr = self.parse_expr()?;
     return Ok(LetGroup(defs, tail_expr))
   }
-  fn traversed_all_chars(&self) -> bool {
-    self.current_char() == Letters::EOT
-  }
   pub fn parse_top_level_decl(&mut self) -> Maybe<RawDecl> {
     if let Some(name) = self.parse_identifier() {
       self.skip_trivia();
@@ -525,7 +514,7 @@ impl <'i> SourceTextParser<'i> {
     let mut items = Vec::new();
     loop {
       self.skip_trivia();
-      if self.traversed_all_chars() { break }
+      if self.no_more_chars() { break }
       if self.current_char() == Letters::SEMICOLON {
         self.skip(1);
         self.skip_trivia();
@@ -569,7 +558,7 @@ pub enum RawPExpr {
 
 
 #[derive(Debug, Clone, Copy)]
-pub struct CharsData { pub offset_from_start: u32, pub offset_from_head: u16 }
+pub struct CharsData { pub off1: u32, pub off2: u16 }
 
 trait Indirect<Item> {
   fn deref(&self) -> &Item;
@@ -587,11 +576,8 @@ pub enum RawTExpr {
   Lambda(Lambda),
   Tuple(Box<Self>, Box<Self>),
   TupleCtor,
-  Arrow,
-  Tilda,
+  InfixOp(InfixOp),
   Star,
-  Or,
-  And,
   Pt,
   EMark
 }
@@ -608,7 +594,7 @@ fn render_raw_texpr(texpr: &RawTExpr, chars_ptr: *const u8, write_target: &mut S
       render_raw_texpr(&r, chars_ptr, write_target);
       write_target.push(')');
     }
-    RawTExpr::Chars(CharsData { offset_from_start, offset_from_head }) => {
+    RawTExpr::Chars(CharsData { off1: offset_from_start, off2: offset_from_head }) => {
       let substr = unsafe {
         let ptr = chars_ptr.add(*offset_from_start as usize);
         std::str::from_utf8_unchecked(
@@ -631,20 +617,16 @@ fn render_raw_texpr(texpr: &RawTExpr, chars_ptr: *const u8, write_target: &mut S
       render_raw_texpr(texpr, chars_ptr, write_target);
       write_target.push(')')
     },
-    RawTExpr::Arrow => {
-      write_target.push_str("->");
-    },
-    RawTExpr::Tilda => write_target.push('~'),
+    RawTExpr::InfixOp(infop) => {
+      match infop {
+        InfixOp::Arrow => write_target.push_str("->"),
+        InfixOp::And => write_target.push_str("and") ,
+        InfixOp::Or => write_target.push_str("or"),
+        InfixOp::Tilda => write_target.push('~'),
+      }
+    }
     RawTExpr::Star => {
       write_target.push('*');
-      // println!("{}", write_target);
-    },
-    RawTExpr::Or => {
-      write_target.push_str("or");
-      // println!("{}", write_target);
-    },
-    RawTExpr::And => {
-      write_target.push_str("and")
     },
     RawTExpr::Let(let_) => {
       let LetGroup(lhs, rhs) = let_.as_ref();
@@ -686,7 +668,7 @@ fn render_raw_pexpr(pexpr: &RawPExpr, chars_ptr: *const u8, write_target: &mut S
       write_target.push(')');
     }
     RawPExpr::Discard => write_target.push('_'),
-    RawPExpr::Chars(CharsData { offset_from_start, offset_from_head }) => {
+    RawPExpr::Chars(CharsData { off1: offset_from_start, off2: offset_from_head }) => {
       let substr = unsafe {
         let ptr = chars_ptr.add(*offset_from_start as usize);
         std::str::from_utf8_unchecked(
@@ -724,12 +706,13 @@ fn letter_distance() {
 }
 
 #[test] #[ignore]
-fn ident_parser() {
+fn ident_parser1() {
   let s = " \nazZ_Z_ZZ_:a_Z_A_z__";
-  let str = String::from_str(s).unwrap();
+  let mut str = String::from_str(s).unwrap();
+  pad_string(&mut str);
   let mut parser = SourceTextParser::new(str.as_bytes());
   parser.skip_trivia();
-  let CharsData { offset_from_start, offset_from_head } =
+  let CharsData { off1:offset_from_start, off2: offset_from_head } =
     parser.parse_identifier().unwrap();
   let str = unsafe {
     let data_ptr = parser.chars.as_ptr().add(offset_from_start as usize);
@@ -737,7 +720,7 @@ fn ident_parser() {
   };
   println!("{}", str);
   parser.state.current_char_ptr = unsafe {parser.state.current_char_ptr.add(1)};
-  let CharsData { offset_from_start, offset_from_head } = parser.parse_identifier().unwrap();
+  let CharsData { off1:offset_from_start, off2: offset_from_head } = parser.parse_identifier().unwrap();
   let str = unsafe {
     let data_ptr = parser.chars.as_ptr().add(offset_from_start as usize);
     std::str::from_utf8_unchecked(std::slice::from_raw_parts(data_ptr, offset_from_head as usize))
@@ -746,73 +729,65 @@ fn ident_parser() {
 }
 
 #[test]
-fn ident_parser_() {
-  let s =
-    "   \n ZazA zAZa";
-  let str = String::from_str(s).unwrap();
-  let mut parser = SourceTextParser::new(str.as_bytes());
-  let depth = parser.probe_depth();
-  assert!(depth == 1);
+fn ident_parser2() {
+  let mut s =
+    "   \n ZazA09 zAZa90".to_string();
+  pad_string(&mut s);
+  let mut parser = SourceTextParser::new(s.as_bytes());
+  parser.skip_trivia();
+  let cd = parser.parse_identifier().unwrap();
+  println!("{:?}", cd);
+  parser.skip_trivia();
   let _ = parser.parse_identifier().unwrap();
-  let depth = parser.probe_depth();
-  assert!(depth == 0);
-  let _ = parser.parse_identifier().unwrap();
+}
+#[test]
+fn ident_parser3() {
+  let mut s =
+    "ZazA0990".to_string();
+  pad_string(&mut s);
+  let mut parser = SourceTextParser::new(s.as_bytes());
+  parser.skip_trivia();
+  let cd = parser.parse_identifier().unwrap();
+  println!("{:?}", cd);
 }
 
 #[test] #[ignore]
 fn decl_parse() {
-  let s =
+  let mut s =
     "".to_string() +
-    "k : i = k => (* -> *) = (cons a _: expr a b) \nand pt { -> => and }"
+    "idT1 : () -> () = { i => i }"
     ;
+  pad_string(&mut s);
   let mut parser = SourceTextParser::new(s.as_bytes());
   // let depth = parser.probe_depth();
-  let expr = parser.parse_top_level_decl();
+  let expr = parser.parse_to_end();
   match expr {
     Err(err) => println!("{:?}", err),
-    Ok(RawDecl(name, tyexpr, oexpr)) => {
+    Ok(r) => {
+      println!("{:#?}", r);
       // let mut str = String::new();
       // let chars = parser.chars.as_ptr();
       // render_raw_texpr(&tyexpr, chars, &mut str);
       // str.push_str(" = ");
       // render_raw_texpr(&oexpr, chars, &mut str);
       // println!("{}", str)
-      println!("{:#?}", oexpr)
+      println!("{:#?}", r[0].2)
     }
   }
 }
 #[test] #[ignore]
 fn expr_parse() {
-  let s =
+  let mut s =
     "".to_string() +
     "{ (,) a b => a (a,b) ((,) a b) }"
     ;
+  pad_string(&mut s);
   let mut parser = SourceTextParser::new(s.as_bytes());
   let expr = parser.parse_expr();
   match expr {
     Err(err) => println!("{:?}", err),
     Ok(expr) => {
       println!("{:#?}", expr)
-    }
-  }
-}
-#[test] #[ignore]
-fn depth_test() {
-  let mut s =
-    "".to_string() +
-    "N : * = () or N;" +
-    "N : * = () or N" +
-    ""
-    ;
-  for _ in s.len() .. (s.len().next_multiple_of(size_of::<u8x4>())) {
-    s.push(Letters::EOT as char);
-  }
-  let mut parser = SourceTextParser::new(s.as_bytes());
-  let expr = parser.parse_to_end();
-  match expr {
-    Err(err) => println!("{:?}", err),
-    Ok(decls) => {
-      println!("{:#?}", decls)
     }
   }
 }
