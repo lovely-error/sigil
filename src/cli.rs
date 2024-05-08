@@ -2,10 +2,10 @@
 use core::panic;
 use std::{fs::File, path::{Path, self}, io::{Write, Read, self, Stdout, BufWriter, stdout, Stdin, stdin}, str::FromStr, cell::UnsafeCell, net::{TcpListener, TcpStream, SocketAddr, SocketAddrV4}, mem::{transmute_copy, replace, size_of}, sync::mpsc::Receiver, any::Any, simd::u8x4,};
 
-use crate::{driver::{TaskContext, Continuation, WorkGroupRef, WorkGroup}, utils::{with_scoped_consume, PageSource}, mpsc::{MPSCQueue}, garbage, lexer::{SourceTextParser, Letters, RawDecl, ParseFailure}, parser::resolve_precendece, sema::{ScopeCheckCtx, ScopedDecl, self, SemanticError, build_defs}};
+use crate::{utils::{with_scoped_consume, PageSource}, garbage, lexer::{SourceTextParser, Letters, RawDecl, ParseFailure}, parser::resolve_precendece, sema::{ScopeCheckCtx, ScopedDecl, self, SemanticError, build_defs}};
 
 
-pub fn main() {
+pub fn run() {
   let _ = main_impl();
   // basic()
 }

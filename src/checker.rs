@@ -1,38 +1,8 @@
-use core::{fmt::Write, cell::UnsafeCell, sync::atomic::compiler_fence};
-use std::{collections::VecDeque, iter::zip, rc::Rc, ptr::addr_of_mut};
+use core::{cell::UnsafeCell, fmt::{Debug, Write}, sync::atomic::compiler_fence};
+use std::{borrow::Cow, collections::{HashSet, VecDeque}, iter::zip, ptr::addr_of_mut, rc::Rc};
 
-use crate::{parser::{Atom, LiftKind, RefinedPExpr}, sema::{ScopedDecl, GenericError, DefId, ScopedTerm, ThinPExpr, Lambda, ScopeCheckCtx, scope_check_decls, RcBox, ScopedTermRepr, render_term, render_thin_pexpr_impl, render_lambda, render_thin_pexpr, render_args, render_decl_impl, LiftNode, render_global_ix, render_term_impl, render_lambda_impl, render_args_impl, SubstIndex}, utils::{Outcome, inside_out}, lexer::{pad_string, SourceTextParser}};
+use crate::{parser::{Atom, RefinedPExpr}, sema::{ScopedDecl, GenericError, DefId, ScopedTerm, ThinPExpr, Lambda, ScopeCheckCtx, scope_check_decls, RcBox, ScopedTermRepr, render_term, render_thin_pexpr_impl, render_lambda, render_thin_pexpr, render_args, render_decl_impl, render_global_ix, render_term_impl, render_lambda_impl, render_args_impl, SubstIndex}, utils::{Outcome, inside_out}, lexer::{pad_string, SourceTextParser}};
 
-trait OutcomeType {
-  type Value;
-  type Failure;
-  fn new_from_value(_: Self::Value) -> Self;
-  fn new_from_failure(_: Self::Failure) -> Self;
-}
-impl <R, E> OutcomeType for ElabResult<Outcome<R, E>> {
-    type Value = R;
-    type Failure = E;
-    fn new_from_value(val: <ElabResult<Outcome<R, E>> as OutcomeType>::Value) -> Self {
-      return ElabResult::Value(Outcome::Result(val));
-    }
-    fn new_from_failure(err: Self::Failure) -> Self {
-      return ElabResult::Value(Outcome::OneErr(err));
-    }
-}
-macro_rules! emit {
-    ($expr:expr) => {
-        {
-          OutcomeType::new_from_value($expr)
-        }
-    };
-}
-macro_rules! throw {
-    ($expr:expr) => {
-      {
-        OutcomeType::new_from_failure($expr)
-      }
-    };
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CheckState {
@@ -43,18 +13,31 @@ enum CheckState {
 }
 
 #[derive(Debug)]
+enum ElabIssue {
+  UnproductiveCycle(Vec<DefId>),
+  InvalidInhabitance,
+  InvalidBinder
+}
+
 struct CheckableDecl(UnsafeCell<CheckableDeclInner>);
+#[derive(Debug)]
 struct CheckableDeclInner {
   scoped_decl: ScopedDecl,
   check_state: CheckState,
-  elab_trace: Option<String>
+  elab_trace: Option<String>,
+  issues: Vec<ElabIssue>
 }
 impl CheckableDecl {
   fn new(
     sd: ScopedDecl
   ) -> Self {
     Self(UnsafeCell::new(CheckableDeclInner {
-      scoped_decl: sd, check_state: CheckState::Untouched, elab_trace: Some(String::new()) }))
+      scoped_decl: sd, check_state: CheckState::Untouched, elab_trace: None,
+      issues: vec![]
+    }))
+  }
+  fn inner(&self) -> &mut CheckableDeclInner {
+    unsafe { &mut*self.0.get() }
   }
   fn get_value(&self) -> ScopedTerm {
     unsafe{(*self.0.get()).scoped_decl.value.shallow_clone()}
@@ -70,1404 +53,682 @@ impl CheckableDecl {
     }
   }
 }
-
+impl Debug for CheckableDecl {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_tuple("CheckableDecl").field(unsafe{&*self.0.get()}).finish()
+  }
+}
+#[derive(Debug)]
 struct ScopedEnv {
   decls: Vec<CheckableDecl>
 }
+struct ElabItem {
 
+}
 struct ElabEnv {
   defs: ScopedEnv,
-  postponed: VecDeque<StuckElab>,
+  postponed: VecDeque<ElabItem>,
 }
 impl ElabEnv {
   fn get_def(&self, gix: DefId) -> &CheckableDecl {
     &self.defs.decls[gix.get_def_index()]
   }
-}
-type StuckElab = Box<dyn FnOnce(*mut ElabEnv) -> ElabResult<Outcome<(), ElabProblem>>>;
-
-fn build_elab_ctx_from_scoped_defs(decls: Vec<ScopedDecl>) -> ElabEnv {
-  let checakbles =
-    decls
-    .into_iter()
-    .map(CheckableDecl::new)
-    .collect();
-  ElabEnv { defs: ScopedEnv { decls: checakbles }, postponed: VecDeque::new() }
-}
-
-fn check_env(ctx: &mut ElabEnv) -> Result<(), Vec<ElabProblem>> {
-  let addr = addr_of_mut!(*ctx);
-  let mut found_errs = Vec::new();
-  for decl in &mut unsafe{&mut*addr}.defs.decls {
-    let decl_inner = unsafe {&mut*decl.0.get()};
-    if decl_inner.check_state == CheckState::Untouched {
-      let outcome = check_def(unsafe{&mut*addr}, decl_inner.scoped_decl.index);
-      match outcome {
-        ElabResult::Stuck => (),
-        ElabResult::Value(value) => {
-          match value {
-            Outcome::OneErr(err) => {
-              found_errs.push(err)
-            },
-            Outcome::ManyErrs(errs) => {
-              found_errs.extend(errs)
-            },
-            Outcome::Result(()) => {
-
-            },
-          }
-        },
-      }
-    }
+  fn new_from_scoped_defs(defs: Vec<ScopedDecl>) -> ElabEnv {
+    let checakbles =
+      defs
+      .into_iter()
+      .map(CheckableDecl::new)
+      .collect();
+    ElabEnv { defs: ScopedEnv { decls: checakbles }, postponed: VecDeque::new() }
   }
-  while let Some(work) = unsafe{&mut*addr}.postponed.pop_front() {
-    let outcome = work(unsafe{&mut*addr});
-    match outcome {
-      ElabResult::Stuck => (),
-      ElabResult::Value(value) => {
-        match value {
-          Outcome::OneErr(err) => {
-            found_errs.push(err)
-          },
-          Outcome::ManyErrs(errs) => {
-            found_errs.extend(errs)
-          },
-          Outcome::Result(()) => (),
+}
+impl Debug for ElabEnv {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let mut s = f.debug_struct("ElabEnv");
+    s.field("defs", &self.defs);
+    s.finish()
+  }
+}
+
+fn check_productivity(
+  ctx: &ElabEnv,
+  start_decl: &CheckableDecl,
+  term: &ScopedTerm,
+  found_ground_terms: &mut bool,
+  mut trace: Vec<DefId>
+) {
+  match term.get_repr() {
+    ScopedTermRepr::App(head, _) => {
+      check_productivity(ctx, start_decl, head, found_ground_terms, trace);
+    },
+    ScopedTermRepr::GlobalRef(id) => {
+      let reappears = trace.contains(id);
+      if reappears { // this is a cycle.
+        if !*found_ground_terms { // which produces no ground terms
+          start_decl.inner().issues.push(ElabIssue::UnproductiveCycle(trace));
         }
-      },
-    }
-  }
-  if !found_errs.is_empty() {
-    return Err(found_errs);
-  }
-  return Ok(());
-}
-
-fn check_def(
-  ctx: &mut ElabEnv,
-  def_ix: DefId
-) -> ElabResult<Outcome<(), ElabProblem>> {
-  let def_ = unsafe { &mut*ctx.defs.decls.as_mut_ptr().add(def_ix.get_def_index())};
-  let def = unsafe { &mut*def_.0.get()};
-  let log_done = |e|{
-    def_.log_elab_if_requested(|log|{
-      let ok = if e { "success" } else { "failure" };
-      write!(log, "Checking of {} has finished with {}", def.scoped_decl.name, ok).unwrap();
-    })
-  };
-  match def.check_state {
-    CheckState::Untouched => {
-      def_.log_elab_if_requested(|log| {
-        write!(log,
-          "When checking def {} aka ",def.scoped_decl.name).unwrap();
-        render_global_ix(log, def.scoped_decl.index)
-      });
-      def.check_state = CheckState::Began
+        return;
+      }
+      trace.push(*id);
+      let next_decl = ctx.get_def(*id);
+      let next_term = &next_decl.inner().scoped_decl.value;
+      check_productivity(ctx, start_decl, next_term, found_ground_terms, trace);
     },
-    CheckState::Began => {
-      let ix = def_ix;
-      let cont = Box::new(move |ctx:*mut ElabEnv|{
-        let ctx = unsafe {&mut*ctx};
-        let _ = check_def(ctx, ix)??;
-        return emit!(());
-      });
-      ctx.postponed.push_back(cont);
-      return ElabResult::Stuck;
-    },
-    CheckState::Ok => {
-      log_done(true);
-      return emit!(())
-    },
-    CheckState::Bad => {
-      log_done(false);
-      return emit!(())
-    },
-  }
-  let mut inners = TCtx::new();
-  let ty_term = def.scoped_decl.type_.shallow_clone();
-  let () = check_inhabitance(
-    ctx,
-    ScopedTerm::new_from_repr(ScopedTermRepr::USort),
-    ty_term.shallow_clone(),
-    &mut inners,
-    &mut TCtx::new(),
-    def_ix)??;
-  let val_term = def.scoped_decl.value.shallow_clone();
-  let () = check_inhabitance(
-    ctx,
-    ty_term,
-    val_term,
-    &mut TCtx::new(),
-    &mut inners,
-    def_ix)??;
-  def.check_state = CheckState::Ok;
-  log_done(true);
-  return emit!(());
-}
-
-#[derive(Debug, Clone)]
-enum ElabProblem {
-  String(String)
-}
-
-enum ElabResult<V> {
-  Stuck,
-  Value(V)
-}
-impl<T> core::ops::FromResidual for ElabResult<T> {
-    fn from_residual((): <Self as std::ops::Try>::Residual) -> Self {
-      ElabResult::Stuck
-    }
-}
-impl<T, E> core::ops::FromResidual<Vec<E>> for ElabResult<Outcome<T, E>> {
-    fn from_residual(residual: Vec<E>) -> Self {
-        Self::Value(Outcome::ManyErrs(residual))
-    }
-}
-impl <T> core::ops::Try for ElabResult<T> {
-    type Output = T;
-    type Residual = ();
-    fn from_output(output: Self::Output) -> Self {
-      Self::Value(output)
-    }
-    fn branch(self) -> std::ops::ControlFlow<Self::Residual, Self::Output> {
-      match self {
-        ElabResult::Stuck => std::ops::ControlFlow::Break(()),
-        ElabResult::Value(val) => std::ops::ControlFlow::Continue(val),
+    ScopedTermRepr::Lambda(clauses) => {
+      let mut count = 0;
+      for clause in clauses {
+        let mut found = false;
+        check_productivity(ctx, start_decl, &clause, &mut found, trace.clone());
+        if found { count += 1 }
+      }
+      if count == clauses.len() {
+        *found_ground_terms = true;
       }
     }
+    ScopedTermRepr::LetGroup(_, _) => todo!(),
+    ScopedTermRepr::SubstRef(_) |
+    ScopedTermRepr::Sigma { .. } |
+    ScopedTermRepr::Pi { .. } |
+    ScopedTermRepr::Void |
+    ScopedTermRepr::Pt |
+    ScopedTermRepr::Either(_, _) |
+    ScopedTermRepr::Arrow(_, _) |
+    ScopedTermRepr::Tuple(_, _) |
+    ScopedTermRepr::Inl(_) |
+    ScopedTermRepr::Inr(_) |
+    ScopedTermRepr::Pair(_, _) => {
+      *found_ground_terms = true;
+      return;
+    },
+    ScopedTermRepr::Null => (),
+    ScopedTermRepr::USort |
+    ScopedTermRepr::Star => (),
+    ScopedTermRepr::LambdaHead(_, tail) => {
+      check_productivity(ctx, start_decl, tail, found_ground_terms, trace)
+    },
+  }
 }
 
-fn elim_ref_to_global_def(
-  ctx: &mut ElabEnv,
-  id: DefId
-) -> ElabResult<Outcome<&CheckableDecl, ElabProblem>> {
-  let def_ = unsafe {&*ctx.defs.decls.as_ptr().add(id.get_def_index())};
-  let def = unsafe {&mut*def_.0.get()};
-  match def.check_state {
-    CheckState::Untouched => {
-      let chk = Box::new(|ctx:*mut ElabEnv|{
-        let () = check_def(unsafe{&mut*ctx}, def.scoped_decl.index)??;
-        let msg = format!("def {} is malformed", def.scoped_decl.name);
-        return throw!(ElabProblem::String(msg));
-      });
-      ctx.postponed.push_back(chk);
-      return ElabResult::Stuck;
-    },
-    CheckState::Began => return ElabResult::Stuck,
-    CheckState::Ok => {
-      return emit!(def_);
-    },
-    CheckState::Bad => {
-      let msg = format!("def {} is malformed", def.scoped_decl.name);
-      return throw!(ElabProblem::String(msg));
-    },
-  }
-}
-struct TCtx {
-  items: Vec<TCtxEntry>
-}
-impl TCtx {
-  fn new() -> Self {
-    Self { items: Vec::new() }
-  }
-  fn append(&mut self, item: TCtxEntry) {
-    self.items.push(item)
-  }
-  fn get(&self, index: SubstIndex) -> &TCtxEntry {
-    self.items.get(index.get_index()).unwrap()
-  }
-}
-impl Clone for TCtx {
-  fn clone(&self) -> Self {
-      Self { items: self.items.clone() }
-  }
-}
-struct TCtxEntry {
-  type_: ScopedTerm
-}
-impl Clone for TCtxEntry {
-  fn clone(&self) -> Self {
-      Self { type_: self.type_.shallow_clone() }
+fn elab(
+  env: &ElabEnv
+) {
+  for item in &env.defs.decls {
+    let mut found_ground = false;
+    let trace = vec![item.inner().scoped_decl.index];
+    check_productivity(env, item, &item.inner().scoped_decl.value, &mut found_ground, trace);
+
+    // let u = ScopedTerm::new_from_repr(ScopedTermRepr::USort);
+    // check_inhabitance(env, item, &u, &item.get_type());
+    check_inhabitance(env, item, &item.get_type(), &item.get_value(), &mut Vec::new());
   }
 }
 
 fn check_inhabitance(
-  ctx: &mut ElabEnv,
-  space: ScopedTerm,
-  resident: ScopedTerm,
-  inner_variable_ty_assocs: &mut TCtx,
-  outer_variable_ty_assocs: &mut TCtx,
-  def_ix: DefId
-) -> ElabResult<Outcome<(), ElabProblem>> {
-  let def = &ctx.defs.decls[def_ix.get_def_index()];
-  def.log_elab_if_requested(|log|{
-    write!(log, "When checking that\n  ").unwrap();
-    render_term_impl(log, &resident);
-    write!(log, "\nis valid inhabitant of\n  ").unwrap();
-    render_term_impl(log, &space);
-  });
-  let inhab_err = || {
-    let msg = format!(
-      "{} is not valid inhabitant of {}",
-      render_term(&resident), render_term(&space));
-    def.log_elab_if_requested(|log| log.write_str(&msg).unwrap());
-    return msg;
-  };
-  match space.get_repr() {
-    ScopedTermRepr::GlobalRef(ix) => {
-      let def = elim_ref_to_global_def(ctx, *ix)??;
-      let def = unsafe {&mut*def.0.get()};
-      let new_space = &def.scoped_decl.value;
-      space.assign_from(&new_space);
-      return check_inhabitance(
-        ctx, space, resident, inner_variable_ty_assocs,outer_variable_ty_assocs, def_ix);
+  env: &ElabEnv,
+  root_def: &CheckableDecl,
+  type_: &ScopedTerm,
+  value: &ScopedTerm,
+  openers: &mut Vec<OpenerTerm>
+) {
+  match type_.get_repr() {
+    t@(ScopedTermRepr::USort | ScopedTermRepr::Star) => {
+      match value.get_repr() {
+        ScopedTermRepr::Pi { binder:_, head, tail } |
+        ScopedTermRepr::Sigma { binder:_, head, tail } => {
+          // check that binder is valid
+          check_inhabitance(env, root_def, type_, head, openers);
+          check_inhabitance(env, root_def, type_, tail, openers);
+        },
+        ScopedTermRepr::Either(a, b) |
+        ScopedTermRepr::Pair(a, b) |
+        ScopedTermRepr::Arrow(a, b) => {
+          check_inhabitance(env, root_def, type_, a, openers);
+          check_inhabitance(env, root_def, type_, b, openers);
+        },
+        ScopedTermRepr::Star => {
+          if let ScopedTermRepr::Star = t {
+            root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+          }
+        },
+        ScopedTermRepr::Void |
+        ScopedTermRepr::Pt => (),
+
+        ScopedTermRepr::GlobalRef(_) => todo!(),
+        ScopedTermRepr::App(_, _) => todo!(),
+        ScopedTermRepr::SubstRef(_) => todo!(),
+        ScopedTermRepr::LetGroup(_, _) => todo!(),
+
+        ScopedTermRepr::Lambda(_) |
+        ScopedTermRepr::Inl(_) |
+        ScopedTermRepr::Inr(_) |
+        ScopedTermRepr::Null |
+        ScopedTermRepr::LambdaHead(_, _) |
+        ScopedTermRepr::Tuple(_, _) => {
+          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+        },
+        ScopedTermRepr::USort => unreachable!(),
+      }
     },
-    ScopedTermRepr::Eval(h, a) => {
-      let evaled = h;
-      let () = elim_eval(ctx, None, evaled.shallow_clone(), a, inner_variable_ty_assocs)??;
-      space.assign_from(&evaled);
-      return check_inhabitance(
-        ctx, space, resident, inner_variable_ty_assocs, outer_variable_ty_assocs,def_ix);
-    },
-    ScopedTermRepr::TypeUnit => {
-      let repr = resident.get_repr();
-      if let ScopedTermRepr::SubstRef(ix) = repr {
-        let val = &inner_variable_ty_assocs.get(*ix).type_;
-        if let ScopedTermRepr::TypeUnit = val.get_repr() {
-          return emit!(());
+    ScopedTermRepr::Arrow(head, tail) => {
+      match value.get_repr() {
+        ScopedTermRepr::Lambda(clauses) => {
+          for clause in clauses {
+            let mut copy = openers.clone();
+            check_inhabitance(env, root_def, type_, clause, &mut copy);
+          }
+        },
+        ScopedTermRepr::LambdaHead(decon_pat, rest) => {
+          check_pi_tip(env, root_def, openers.last_mut().unwrap(), head, decon_pat);
+          check_inhabitance(env, root_def, tail, rest, openers)
+        }
+        _ => {
+          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+          return;
         }
       }
-      if let ScopedTermRepr::ValueUnit = repr {
-        return emit!(());
-      }
-      if let ScopedTermRepr::SomePt = repr {
-        resident.set_repr(ScopedTermRepr::ValueUnit);
-        return emit!(());
-      }
-      let msg = inhab_err();
-      return  throw!(ElabProblem::String(msg));
     }
-    ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::SubstRef(tsr) => {
-      match resident.get_repr() {
-        ScopedTermRepr::Eval(sh, a) => {
-          let codo = check_args_for_app(
-            ctx,
-            sh.shallow_clone(),
-            a,
-            inner_variable_ty_assocs,
-            outer_variable_ty_assocs,
-            def_ix)??;
-          let ty = outer_variable_ty_assocs.get(*tsr);
-          return check_types_compatible(
-            ctx,
-            ty.type_.shallow_clone(),
-            codo,
-            outer_variable_ty_assocs,
-            inner_variable_ty_assocs,
-            def_ix);
-        },
-        ScopedTermRepr::GlobalRef(_) => todo!(),
-        ScopedTermRepr::SubstRef(vsr) => {
-          let st = outer_variable_ty_assocs.get(*tsr);
-          let rt = inner_variable_ty_assocs.get(*vsr);
-          return check_types_compatible(
-            ctx,
-            st.type_.shallow_clone(),
-            rt.type_.shallow_clone(),
-            outer_variable_ty_assocs,
-            inner_variable_ty_assocs, def_ix);
-        },
-        ScopedTermRepr::AtomRef(_) => todo!(),
-        ScopedTermRepr::Lift(_) => todo!(),
-        ScopedTermRepr::Star => todo!(),
-        ScopedTermRepr::LetGroup(_, _) => todo!(),
-        ScopedTermRepr::Lambda(_) => todo!(),
-        ScopedTermRepr::SomePt => todo!(),
-        ScopedTermRepr::Void => todo!(),
-        ScopedTermRepr::AtomApp(_, _) => todo!(),
-        ScopedTermRepr::USort => todo!(),
-        ScopedTermRepr::TypeUnit => todo!(),
-        ScopedTermRepr::ValueUnit => todo!(),
-        ScopedTermRepr::Unknown => todo!(),
-      }
-      // return check_types_compatible(
-      //   ctx, space, r_ty, l_variable_ty_assocs, r_variable_ty_assocs, def_ix);
-    },
-    ScopedTermRepr::Lift(LiftNode(k, _, _, _)) => {
-      match (k, resident.get_repr()) {
-        (LiftKind::Arrow, ScopedTermRepr::Lambda(lambda)) => {
-          return check_lambda(
-            ctx, space, lambda,outer_variable_ty_assocs, inner_variable_ty_assocs, def_ix);
-        },
-        (LiftKind::And, ScopedTermRepr::AtomApp(Atom::TupleCtor, val_args)) => {
-          let part = val_args.len() != 2;
-          if part {
-            let msg = inhab_err();
-            return throw!(ElabProblem::String(msg))
+    ScopedTermRepr::Pi { binder:_, head, tail } => {
+      match value.get_repr() {
+        ScopedTermRepr::Lambda(clauses) => {
+          for clause in clauses {
+            let mut copy = openers.clone();
+            check_inhabitance(env, root_def, type_, clause, &mut copy);
           }
-          todo!("algo has hit missing impl")
+        },
+        ScopedTermRepr::LambdaHead(decon_pat, rest) => {
+          openers.push(OpenerTerm::Unrefined);
+          check_pi_tip(env, root_def, openers.last_mut().unwrap(), head, decon_pat);
+          check_inhabitance(env, root_def, tail, rest, openers)
+        }
+        _ => {
+          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+          return;
+        }
+      }
+    },
+    ScopedTermRepr::Sigma { binder, head, tail } => {
+      let ScopedTermRepr::Tuple(fst, snd) = value.get_repr() else {
+        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+        return;
+      };
+      todo!()
+    },
+    ScopedTermRepr::Pair(_, _) => {
+      let ScopedTermRepr::Tuple(_, _) = value.get_repr() else {
+        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+        return;
+      };
+      todo!()
+    },
+    ScopedTermRepr::Either(l, r) => {
+      match value.get_repr() {
+        ScopedTermRepr::Inl(v) => {
+          check_inhabitance(env, root_def, l, v, openers);
+        },
+        ScopedTermRepr::Inr(v) => {
+          check_inhabitance(env, root_def, r, v, openers);
         },
         _ => {
-          let msg = inhab_err();
-          return throw!(ElabProblem::String(msg));
+          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+          return;
         }
       }
     },
-    ScopedTermRepr::USort | ScopedTermRepr::Star => {
-      match resident.get_repr() {
-        ScopedTermRepr::Lift(LiftNode(_, decon, hd, sp)) => {
-          // check well formdness of this thing
-          check_inhabitance(
-            ctx, space.shallow_clone(), hd.shallow_clone(),
-            inner_variable_ty_assocs, outer_variable_ty_assocs, def_ix);
-          pattern_can_deconstruct_value_of_type(
-            ctx,decon, hd.shallow_clone(), outer_variable_ty_assocs,
-            inner_variable_ty_assocs, def_ix);
-          return check_inhabitance(
-            ctx, space, sp.shallow_clone(),
-            inner_variable_ty_assocs, outer_variable_ty_assocs, def_ix);
-        },
-        ScopedTermRepr::SomePt => {
-          resident.assign_from(&ScopedTerm::new_from_repr(ScopedTermRepr::TypeUnit));
-          return emit!(());
-        }
-        ScopedTermRepr::Star => {
-          if let ScopedTermRepr::Star = space.get_repr() {
-            return throw!(ElabProblem::String(inhab_err()));
-          } else {
-            return emit!(());
-          }
-        }
-        ScopedTermRepr::TypeUnit |
-        ScopedTermRepr::Void => return emit!(()),
-        ScopedTermRepr::AtomApp(atom, val_args) => {
-          match atom {
-            Atom::And |
-            Atom::Or |
-            Atom::Arrow |
-            Atom::Tilda => {
-              if val_args.len() != 2 {
-                let msg = inhab_err();
-                return throw!(ElabProblem::String(msg));
-              }
-              let mut checks = Vec::new();
-              for val_arg in val_args {
-                let outcome = check_inhabitance(
-                  ctx,
-                  space.shallow_clone(),
-                  val_arg.shallow_clone(),
-                  inner_variable_ty_assocs,
-                  outer_variable_ty_assocs,
-                  def_ix)?;
-                checks.push(outcome);
-              }
-              let _ = inside_out(&checks)?;
-              return emit!(());
-            },
-            Atom::TupleCtor |
-            Atom::Inl |
-            Atom::Inr => {
-              let msg = inhab_err();
-              return throw!(ElabProblem::String(msg));
-            },
-          }
-        },
-        ScopedTermRepr::Unknown |
-        ScopedTermRepr::ValueUnit |
-        ScopedTermRepr::AtomRef(_) |
-        ScopedTermRepr::Lambda(_) => {
-          let msg = inhab_err();
-          return throw!(ElabProblem::String(msg));
-        },
-        ScopedTermRepr::SubstRef(ix) => {
-          let ty = &inner_variable_ty_assocs.get(*ix).type_;
-          if let ScopedTermRepr::Star = ty.get_repr_mut() {
-            return emit!(())
-          } else {
-            return throw!(ElabProblem::String(inhab_err()));
-          }
-        }
-        ScopedTermRepr::Eval(h, a) => {
-          let codo = check_args_for_app(
-            ctx, h.shallow_clone(), a,
-            inner_variable_ty_assocs,outer_variable_ty_assocs, def_ix)??;
-          return check_inhabitance(
-            ctx, space, codo,inner_variable_ty_assocs,outer_variable_ty_assocs, def_ix);
-        },
-        ScopedTermRepr::GlobalRef(gix)  => {
-          let def = elim_ref_to_global_def(ctx, *gix)??;
-          let def = unsafe {&mut*def.0.get()};
-          resident.assign_from(&def.scoped_decl.value);
-          return check_inhabitance(
-            ctx, space, resident, inner_variable_ty_assocs,outer_variable_ty_assocs, def_ix)
-        },
-        ScopedTermRepr::LetGroup(_, _) => todo!(),
-        ScopedTermRepr::USort => panic!("this shouldnt happen"),
-      }
-    },
-    ScopedTermRepr::SomePt => {
-      if let ScopedTermRepr::SomePt = resident.get_repr() {
-        resident.assign_from(&ScopedTerm::new_from_repr(ScopedTermRepr::TypeUnit));
-        resident.assign_from(&ScopedTerm::new_from_repr(ScopedTermRepr::ValueUnit));
-        return emit!(());
-      } else {
-        let msg = inhab_err();
-        return throw!(ElabProblem::String(msg));
-      }
-    },
-    ScopedTermRepr::Void => {
-      let msg = inhab_err();
-      return throw!(ElabProblem::String(msg));
-    }
-    ScopedTermRepr::AtomApp(ty_atom, ty_args) => {
-      match resident.get_repr() {
-        ScopedTermRepr::AtomApp(val_atom, val_args) => {
-          match (ty_atom, val_atom) {
-            (Atom::TupleCtor, Atom::And) => {
-              let l_ty = ty_args[0].shallow_clone();
-              let l_v = val_args[0].shallow_clone();
-              let () = check_inhabitance(
-                ctx, l_ty, l_v, inner_variable_ty_assocs,outer_variable_ty_assocs, def_ix)??;
-              let r_ty = ty_args[1].shallow_clone();
-              let r_v = val_args[1].shallow_clone();
-              let () = check_inhabitance(
-                ctx, r_ty, r_v, inner_variable_ty_assocs, outer_variable_ty_assocs, def_ix)??;
-              return emit!(());
-            },
-            (Atom::Or, Atom::Inl) => {
-              let l_ty = ty_args[0].shallow_clone();
-              let l_v = val_args[0].shallow_clone();
-              return check_inhabitance(
-                ctx, l_ty, l_v, inner_variable_ty_assocs, outer_variable_ty_assocs,def_ix);
-            },
-            (Atom::Or, Atom::Inr) => {
-              let r_ty = ty_args[1].shallow_clone();
-              let r_v = val_args[0].shallow_clone();
-              return check_inhabitance(
-                ctx, r_ty, r_v, inner_variable_ty_assocs, outer_variable_ty_assocs,def_ix);
-            },
-            _ => {
-              let msg = inhab_err();
-              return throw!(ElabProblem::String(msg));
-            }
-          }
-        },
-        ScopedTermRepr::Lambda(lambda) => {
-          return check_lambda(
-            ctx, space.shallow_clone(), lambda,
-            outer_variable_ty_assocs,inner_variable_ty_assocs, def_ix);
-        }
-        ScopedTermRepr::Unknown |
-        ScopedTermRepr::TypeUnit |
-        ScopedTermRepr::ValueUnit |
-        ScopedTermRepr::Lift(_) |
-        ScopedTermRepr::Star |
-        ScopedTermRepr::SomePt |
-        ScopedTermRepr::AtomRef(_) |
-        ScopedTermRepr::Void => {
-          let msg = inhab_err();
-          return throw!(ElabProblem::String(msg));
-        },
-        ScopedTermRepr::SubstRef(ix) => {
-          let ty = inner_variable_ty_assocs.get(*ix).type_.shallow_clone();
-          return check_types_compatible(
-            ctx, space, ty, outer_variable_ty_assocs, inner_variable_ty_assocs, def_ix);
-        }
-        ScopedTermRepr::GlobalRef(gix) => {
-          let def = elim_ref_to_global_def(ctx, *gix)??;
-          let def = unsafe {&mut*def.0.get()};
-          resident.assign_from(&def.scoped_decl.value);
-          return check_inhabitance(
-            ctx, space, resident, inner_variable_ty_assocs, outer_variable_ty_assocs,def_ix);
-        }
-        ScopedTermRepr::Eval(h, a) => {
-          let codo = check_args_for_app(
-            ctx, h.shallow_clone(), a,
-            inner_variable_ty_assocs,outer_variable_ty_assocs, def_ix)??;
-          return check_types_compatible(
-            ctx, space, codo, inner_variable_ty_assocs, outer_variable_ty_assocs, def_ix);
-        }
-        ScopedTermRepr::LetGroup(_, _) => todo!(),
-        ScopedTermRepr::USort => panic!("this shouldnt happen"),
-      }
-    }
-    ScopedTermRepr::Unknown |
-    ScopedTermRepr::ValueUnit |
-    ScopedTermRepr::AtomRef(_) |
-    ScopedTermRepr::Lambda(_) => {
-      let msg = inhab_err();
-      return throw!(ElabProblem::String(msg));
-    },
-  }
-}
-
-
-fn check_decons_against_arrow(
-  ctx: &mut ElabEnv,
-  arrow_ty_term: ScopedTerm,
-  patterns: &[ThinPExpr],
-  variable_ty_assocs: &mut TCtx,
-  def_ix: DefId,
-  arrow_scope_binds: &mut TCtx
-) -> ElabResult<Outcome<ScopedTerm, ElabProblem>> {
-  if patterns.is_empty() {
-    return emit!(arrow_ty_term);
-  }
-  let def = ctx.get_def(def_ix);
-  let invalid_term_err = || {
-    let msg = format!("expected type, got {}", render_term(&arrow_ty_term));
-    def.log_elab_if_requested(|log| log.write_str(&msg).unwrap());
-    return msg;
-  };
-  match arrow_ty_term.get_repr_mut() {
-    ScopedTermRepr::AtomApp(atom, ty_args) => {
-      match atom {
-        Atom::Arrow => {
-          let arg = ty_args[0].shallow_clone();
-          let pat = &patterns[0];
-          pattern_can_deconstruct_value_of_type(
-            ctx,pat, arg, arrow_scope_binds,variable_ty_assocs, def_ix)??;
-          let tail = &patterns[1..];
-          return check_decons_against_arrow(
-            ctx, ty_args[1].shallow_clone(), tail, variable_ty_assocs, def_ix, arrow_scope_binds);
-        },
-        Atom::And |
-        Atom::Or |
-        Atom::Tilda |
-        Atom::TupleCtor |
-        Atom::Inl |
-        Atom::Inr => {
-          let msg = invalid_term_err();
-          return throw!(ElabProblem::String(msg));
-        },
-      }
-    },
-    ScopedTermRepr::Unknown |
-    ScopedTermRepr::TypeUnit |
-    ScopedTermRepr::ValueUnit |
-    ScopedTermRepr::AtomRef(_) |
-    ScopedTermRepr::Lambda(_) => {
-      let msg = invalid_term_err();
-      return throw!(ElabProblem::String(msg));
-    },
-    ScopedTermRepr::Lift(_) |
-    ScopedTermRepr::Star |
-    ScopedTermRepr::SomePt |
-    ScopedTermRepr::Void => {
-      let msg = format!(
-        "expected arrow term, got {:?}",
-        arrow_ty_term.get_repr_mut());
-      return throw!(ElabProblem::String(msg));
-    },
-    ScopedTermRepr::Eval(head, args) => {
-      let cloned = head.shallow_clone();
-      elim_eval(ctx, None, cloned.shallow_clone(), args, variable_ty_assocs)??;
-      arrow_ty_term.assign_from(&cloned);
-      return check_decons_against_arrow(
-        ctx, arrow_ty_term, patterns, variable_ty_assocs, def_ix, arrow_scope_binds);
-    }
-    ScopedTermRepr::GlobalRef(id) => {
-      let def = elim_ref_to_global_def(ctx, *id)??;
-      let def = unsafe {&mut*def.0.get()};
-      let ty = &def.scoped_decl.value;
-      arrow_ty_term.assign_from(&ty);
-      return check_decons_against_arrow(
-        ctx, arrow_ty_term, patterns, variable_ty_assocs, def_ix, arrow_scope_binds);
+    ScopedTermRepr::App(tar, args) => {
+      let tar = tar.deep_lazy_clone();
+      elim_app(env, root_def, &tar, args, openers);
+      check_inhabitance(env, root_def, &tar, value, openers)
     },
     ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::SubstRef(ix) => {
-      let ty = arrow_scope_binds.get(*ix).type_.shallow_clone();
-      return check_decons_against_arrow(
-        ctx, ty, patterns, variable_ty_assocs, def_ix, arrow_scope_binds);
-    },
-    ScopedTermRepr::USort => panic!("this shouldnt happen"),
-  }
-}
-
-fn pattern_can_deconstruct_value_of_type(
-  ctx: &mut ElabEnv,
-  pattern: &ThinPExpr,
-  ty_term: ScopedTerm,
-  outer_binds: &mut TCtx,
-  inner_binds: &mut TCtx,
-  def_ix: DefId
-) -> ElabResult<Outcome<(), ElabProblem>> {
-  let def = ctx.get_def(def_ix);
-  let build_err = || {
-    let msg = format!(
-      "{} is not valid deconstructor for {}",
-      render_thin_pexpr(pattern), render_term(&ty_term));
-    def.log_elab_if_requested(|log| log.write_str(&msg).unwrap());
-    return msg;
-  };
-  match pattern {
-    ThinPExpr::Discard => {
-      if let ScopedTermRepr::Void = ty_term.get_repr_mut() {
-        let msg = format!("Void does not have deconstructors");
-        return throw!(ElabProblem::String(msg));
-      }
-      return emit!(());
-    },
-    ThinPExpr::Binder(_) => {
-      if let ScopedTermRepr::Void = ty_term.get_repr_mut() {
-        let msg = format!("Void does not have deconstructors");
-        return throw!(ElabProblem::String(msg));
-      }
-      let entry = TCtxEntry {
-        type_: ty_term
-      };
-      inner_binds.append(entry);
-      return emit!(());
-    },
-    ThinPExpr::Group(atom, sub_pats) => {
-      match atom {
-        Atom::Tilda | Atom::Arrow | Atom::And | Atom::Or => {
-          if let ScopedTermRepr::Star = ty_term.get_repr_mut() {
-            for sub_pat in sub_pats {
-              let () = pattern_can_deconstruct_value_of_type(
-                ctx,
-                sub_pat,
-                ty_term.shallow_clone(),
-                outer_binds,
-                inner_binds,
-                def_ix)??;
-            }
-            return emit!(());
-          } else {
-            let msg = build_err();
-            return throw!(ElabProblem::String(msg));
-          }
-        },
-        Atom::TupleCtor => {
-          if let ScopedTermRepr::AtomApp(Atom::And, ty_args) = ty_term.get_repr_mut() {
-            for (sub_pat, ty_arg) in zip(sub_pats, ty_args) {
-              let () = pattern_can_deconstruct_value_of_type(
-                ctx,
-                sub_pat,
-                ty_arg.shallow_clone(),
-                outer_binds,
-                inner_binds,
-                def_ix)??;
-            }
-            return emit!(());
-          } else {
-            let msg = build_err();
-            return throw!(ElabProblem::String(msg));
-          }
-        },
-        Atom::Inl => {
-          if let ScopedTermRepr::AtomApp(Atom::Or, ty_args) = ty_term.get_repr_mut() {
-            return pattern_can_deconstruct_value_of_type(
-              ctx,
-              &sub_pats[0],
-              ty_args[0].shallow_clone(),
-              outer_binds,
-              inner_binds,
-              def_ix);
-          } else {
-            let msg = build_err();
-            return throw!(ElabProblem::String(msg));
-          }
-        },
-        Atom::Inr => {
-          if let ScopedTermRepr::AtomApp(Atom::Or, ty_args) = ty_term.get_repr_mut() {
-            return pattern_can_deconstruct_value_of_type(
-              ctx,
-              &sub_pats[1],
-              ty_args[1].shallow_clone(),
-              outer_binds,
-              inner_binds,
-              def_ix);
-          } else {
-            let msg = build_err();
-            return throw!(ElabProblem::String(msg));
-          }
-        },
-      }
-    },
-    ThinPExpr::Pt => {
-      if let ScopedTermRepr::SomePt = ty_term.get_repr_mut() {
-        return emit!(());
-      }
-      let msg = build_err();
-      return throw!(ElabProblem::String(msg));
-    },
-  }
-}
-
-fn elim_eval(
-  ctx: &mut ElabEnv,
-  dir_ty_term: Option<ScopedTerm>,
-  head: ScopedTerm,
-  args: &Vec<ScopedTerm>,
-  variable_ty_assocs: &TCtx
-) -> ElabResult<Outcome<(), ElabProblem>> {
-  match head.get_repr_mut() {
-    ScopedTermRepr::Eval(subhead, subargs) => {
-      let cloned = subhead.shallow_clone();
-      let () = elim_eval(ctx, None, cloned.shallow_clone(), subargs, variable_ty_assocs)??;
-      head.assign_from(&cloned);
-      return elim_eval(ctx, dir_ty_term, head, args, variable_ty_assocs);
-    },
-    ScopedTermRepr::GlobalRef(def_id) => {
-      let def = unsafe {&mut*ctx.defs.decls.as_mut_ptr().add(def_id.get_def_index())};
-      let def = unsafe {&mut*def.0.get()};
-      match def.check_state {
-        CheckState::Untouched => {
-          // charge check of unchecked def
-          let check = Box::new(move |ctx:*mut ElabEnv|{
-            let () = check_def(unsafe{&mut*ctx}, def.scoped_decl.index)??;
-            return emit!(());
-          });
-          ctx.postponed.push_back(check);
-          // recheck
-          let dir_ty = match dir_ty_term {
-            Some(dir_ty) => Some(dir_ty.shallow_clone()),
-            None => None,
-          };
-          let head = head.shallow_clone();
-          let args: Vec<_> = args.iter().map(|e|e.shallow_clone()).collect();
-          let c = variable_ty_assocs.clone();
-          let continuation = Box::new(move |ctx:*mut ElabEnv| {
-            elim_eval(unsafe{&mut*ctx}, dir_ty, head, &args, &c)
-          });
-          ctx.postponed.push_back(continuation);
-          return ElabResult::Stuck;
-        },
-        CheckState::Began => return ElabResult::Stuck,
-        CheckState::Ok => {
-          let val = &def.scoped_decl.value;
-          head.assign_from(&val);
-          let ty = def.scoped_decl.type_.shallow_clone();
-          return elim_eval(ctx, Some(ty), head, args, variable_ty_assocs);
-        },
-        CheckState::Bad => {
-          let msg = format!("cant continue becase of bad def {}", def.scoped_decl.name);
-          return throw!(ElabProblem::String(msg))
-        },
-      }
-    },
-    ScopedTermRepr::SubstRef(_) => {
-      todo!("??")
-    },
-    ScopedTermRepr::AtomRef(atom) => {
-      let arg_lim = atom.arg_limit();
-      if args.len() > arg_lim {
-        let msg = format!(
-          "invalid app to\n  {}\n\n of\n\n  {}",
-          render_term(&head), render_args(args));
-        return throw!(ElabProblem::String(msg))
-      }
-      let repr = ScopedTermRepr::AtomApp(*atom, args.iter().map(|e|e.shallow_clone()).collect());
-      head.set_repr(repr);
-      return emit!(());
-    },
-    ScopedTermRepr::LetGroup(_, _) => {
-      // need to get result from let block
-      todo!()
-    },
-    ScopedTermRepr::Lambda(lambda) => {
-      let dir_ty_term = match dir_ty_term {
-        Some(dt) => dt,
-        None => {
-          // synth plain type from lambda def
-          todo!()
-        },
-      };
-
-      let thing = apply(ctx, lambda, args, variable_ty_assocs)??;
-      head.assign_from(&thing);
-      return emit!(());
-    },
-    ScopedTermRepr::Unknown |
-    ScopedTermRepr::TypeUnit |
-    ScopedTermRepr::ValueUnit |
-    ScopedTermRepr::Void |
-    ScopedTermRepr::Lift(_) |
-    ScopedTermRepr::Star |
-    ScopedTermRepr::SomePt => {
-      let msg = format!("{:?} is not a valid head", head.get_repr_mut());
-      return throw!(ElabProblem::String(msg));
-    },
-    ScopedTermRepr::AtomApp(atom, present_args) => {
-      let arg_limit = atom.arg_limit();
-      if present_args.len() + args.len() > arg_limit {
-        let msg = format!("invalid app {:?} {:?}", head.get_repr_mut(), args);
-        return throw!(ElabProblem::String(msg))
-      }
-      let mut args_:Vec<_> = present_args.iter().map(|e|e.shallow_clone()).collect();
-      for arg in args {
-        args_.push(arg.shallow_clone())
-      }
-      return emit!(());
-    }
-    ScopedTermRepr::USort => panic!("this shouldnt happen"),
-  }
-}
-
-fn apply(
-  ctx: &mut ElabEnv,
-  lambda: &Lambda,
-  args: &Vec<ScopedTerm>,
-  variable_ty_assocs: &TCtx
-) -> ElabResult<Outcome<ScopedTerm, ElabProblem>> {
-
-  let Lambda(clauses) = lambda;
-  let mut bind_store = Vec::new();
-  let mut matched = None;
-  'clause_matching:for (decontructors, rhs) in clauses {
-    let mut ok = true;
-    for (decon, arg) in zip(decontructors, args) {
-      let () = bind_values(
-        ctx, &mut ok, &mut bind_store, decon, arg.shallow_clone(), variable_ty_assocs)??;
-      if !ok {
-        bind_store.clear();
-        continue 'clause_matching;
-      }
-    }
-    matched = Some(rhs); break 'clause_matching;
-  }
-  let Some(rhs) = matched else {
-    let msg = format!(
-      "lambda did not match arguments!!\nLambda\n\n{}\nArgs\n\n{}",
-      render_lambda(lambda), render_args(args));
-    return throw!(ElabProblem::String(msg));
-  };
-  let mut clone = rhs.deep_lazy_clone();
-  fill(&bind_store, &mut clone);
-  return emit!(clone);
-}
-
-fn fill(
-  bind_store: &Vec<ScopedTerm>,
-  template_term: &mut ScopedTerm
-) {
-  match template_term.get_repr_mut() {
-    ScopedTermRepr::Eval(h, args) => {
-      fill(bind_store, h);
-      for arg in args {
-        fill(bind_store, arg);
-      }
-    },
-    ScopedTermRepr::GlobalRef(_) => {
-      ()
-    },
-    ScopedTermRepr::SubstRef(ix) => {
-      let subst = &bind_store[ix.get_index()];
-      *template_term = subst.shallow_clone();
-    },
-    ScopedTermRepr::AtomRef(_) => {
-      ()
-    },
-    ScopedTermRepr::Lift(LiftNode(_, _, ty, spine)) => {
-      fill(bind_store, ty);
-      fill(bind_store, spine);
-    },
-    ScopedTermRepr::Star => {
-      ()
-    },
-    ScopedTermRepr::LetGroup(l, r) => {
-      for (_, ty, val) in l {
-        fill(bind_store, ty);
-        fill(bind_store, val);
-      }
-      fill(bind_store, r);
-    },
-    ScopedTermRepr::Lambda(Lambda(clauses)) => {
-      for (_, rhs) in clauses {
-        fill(bind_store, rhs);
-      }
-    },
-    ScopedTermRepr::SomePt => {
-      ()
-    },
-    ScopedTermRepr::Void => {
-      ()
-    },
-    ScopedTermRepr::AtomApp(_, args) => {
-      for arg in args {
-        fill(bind_store, arg);
-      }
-    },
-    ScopedTermRepr::TypeUnit => (),
-    ScopedTermRepr::ValueUnit => (),
-    ScopedTermRepr::USort => panic!("this shouldnt happen"),
-    ScopedTermRepr::Unknown => (),
-  }
-}
-
-fn bind_values(
-  ctx: &mut ElabEnv,
-  ok: &mut bool,
-  bind_store: &mut Vec<ScopedTerm>,
-  pattern: &ThinPExpr,
-  arg: ScopedTerm,
-  variable_ty_assocs: &TCtx
-) -> ElabResult<Outcome<(), ElabProblem>> {
-  if !*ok { return emit!(()) }
-  match (pattern, arg.get_repr_mut()) {
-    (ThinPExpr::Discard, _) => emit!(()),
-    (ThinPExpr::Binder(_), _) => {
-      bind_store.push(arg.shallow_clone());
-      emit!(())
-    },
-    (_, ScopedTermRepr::Eval(head, args)) => {
-      let evaled = head.shallow_clone();
-      let () = elim_eval(ctx, None, evaled.shallow_clone(), args, variable_ty_assocs)??;
-      arg.assign_from(&evaled);
-      return bind_values(ctx, ok, bind_store, pattern, evaled.shallow_clone(), variable_ty_assocs);
-    },
-    (_, ScopedTermRepr::LetGroup(_, _)) => todo!(),
-    (_, ScopedTermRepr::GlobalRef(id)) => {
-      let def = elim_ref_to_global_def(ctx, *id)??;
-      let def = unsafe {&mut*def.0.get()};
-      let val = &def.scoped_decl.value;
-      arg.assign_from(&val);
-      return bind_values(ctx, ok, bind_store, pattern, arg, variable_ty_assocs);
-    },
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Star) => {
-      panic!("this shouldnt happen")
-    }
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Lambda(_)) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::SomePt) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Void) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::SubstRef(_)) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Lift(_)) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::AtomRef(_)) => {
-      return emit!(());
-    },
-    (ThinPExpr::Group(pattern_atom, subpats), ScopedTermRepr::AtomApp(ctor_atom, subvals)) => {
-      if pattern_atom != ctor_atom {
-        *ok = false;
-        return emit!(());
-      }
-      for (subpat, subval) in zip(subpats, subvals) {
-        let () = bind_values(
-          ctx, ok, bind_store, subpat, subval.shallow_clone(), variable_ty_assocs)??;
-        if !*ok { return emit!(()) }
-      }
-      return emit!(());
-    },
-    (ThinPExpr::Pt, ScopedTermRepr::SomePt) => {
-      return emit!(());
-    },
-    (ThinPExpr::Pt, ScopedTermRepr::SubstRef(_)) |
-    (ThinPExpr::Pt, ScopedTermRepr::AtomRef(_)) |
-    (ThinPExpr::Pt, ScopedTermRepr::Lift(_)) |
-    (ThinPExpr::Pt, ScopedTermRepr::Star) => {
-      panic!("this shouldnt happen")
-    }
-    (ThinPExpr::Pt, ScopedTermRepr::TypeUnit) |
-    (ThinPExpr::Pt, ScopedTermRepr::ValueUnit) |
-    (ThinPExpr::Pt, ScopedTermRepr::Lambda(_)) |
-    (ThinPExpr::Pt, ScopedTermRepr::Void) |
-    (ThinPExpr::Pt, ScopedTermRepr::AtomApp(_, _)) => {
-      return emit!(());
-    },
-    (ThinPExpr::Group(_, _), ScopedTermRepr::TypeUnit) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::ValueUnit) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Unknown) |
-    (ThinPExpr::Pt, ScopedTermRepr::Unknown) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::USort) |
-    (ThinPExpr::Pt, ScopedTermRepr::USort) => panic!("this shouldnt happen"),
-
-  }
-}
-
-fn check_args_for_app(
-  ctx: &mut ElabEnv,
-  head: ScopedTerm,
-  args: &[ScopedTerm],
-  inner_variable_ty_assocs: &mut TCtx,
-  outer_variable_ty_assocs: &mut TCtx,
-  def_ix: DefId,
-) -> ElabResult<Outcome<ScopedTerm, ElabProblem>> {
-  let def = ctx.get_def(def_ix);
-  def.log_elab_if_requested(|log|{
-    log.write_str("When checking application of\n  ").unwrap();
-    render_args_impl(log, args);
-    log.write_str("\nto head term\n  ").unwrap();
-    render_term_impl(log, &head);
-  });
-  match head.get_repr() {
-    ScopedTermRepr::Eval(sh, sa) => {
-      let codo = check_args_for_app(
-        ctx, sh.shallow_clone(), sa, inner_variable_ty_assocs, outer_variable_ty_assocs, def_ix)??;
-      return check_args_for_app(
-        ctx, codo, args, inner_variable_ty_assocs, outer_variable_ty_assocs, def_ix);
-    },
-    ScopedTermRepr::GlobalRef(ix) => {
-      let def = elim_ref_to_global_def(ctx, *ix)??;
-      let def = unsafe {&mut*def.0.get()};
-      let ty = def.scoped_decl.type_.shallow_clone();
-      return check_args_against_arrow_ty(
-        ctx, ty, args, inner_variable_ty_assocs, outer_variable_ty_assocs,def_ix);
-    },
-    ScopedTermRepr::SubstRef(_) => todo!(),
-    ScopedTermRepr::AtomRef(_) => todo!(),
-    ScopedTermRepr::Lift(_) => todo!(),
-    ScopedTermRepr::Star => todo!(),
-    ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::Lambda(_) => todo!(),
-    ScopedTermRepr::SomePt => todo!(),
-    ScopedTermRepr::Void => todo!(),
-    ScopedTermRepr::AtomApp(_, _) => todo!(),
-    ScopedTermRepr::USort => todo!(),
-    ScopedTermRepr::TypeUnit => todo!(),
-    ScopedTermRepr::ValueUnit => todo!(),
-    ScopedTermRepr::Unknown => todo!(),
-  }
-}
-/// returns codo type
-fn check_args_against_arrow_ty(
-  ctx: &mut ElabEnv,
-  arrow_ty: ScopedTerm,
-  args: &[ScopedTerm],
-  value_bindings: &mut TCtx,
-  arrow_level_binds: &mut TCtx,
-  def_ix: DefId
-) -> ElabResult<Outcome<ScopedTerm, ElabProblem>>{
-  if args.is_empty() {
-    return emit!(arrow_ty);
-  }
-  let def = ctx.get_def(def_ix);
-  def.log_elab_if_requested(|log|{
-    log.write_str("When checking application to\n  ").unwrap();
-    render_term_impl(log,&arrow_ty);
-    log.write_str("\nof args\n  ").unwrap();
-    write!(log, "{:?}", args).unwrap();
-  });
-  match arrow_ty.get_repr_mut() {
-    ScopedTermRepr::AtomApp(atom, aps) => {
-      match atom {
-        Atom::Arrow => {
-          let ty = aps[0].shallow_clone();
-          let arg = args[0].shallow_clone();
-          let ty = if let ScopedTermRepr::Star = ty.get_repr_mut() {
-            ScopedTerm::new_from_repr(ScopedTermRepr::USort)
-          } else { ty };
-          let () = check_inhabitance(
-            ctx, ty, arg, value_bindings, arrow_level_binds, def_ix)??;
-          let tys = aps[1].shallow_clone();
-          let args = &args[1..];
-          return check_args_against_arrow_ty(
-            ctx, tys, args, value_bindings, arrow_level_binds, def_ix);
-        },
-        Atom::And |
-        Atom::Or |
-        Atom::Tilda |
-        Atom::TupleCtor |
-        Atom::Inl |
-        Atom::Inr => todo!(),
-      }
-    },
-    ScopedTermRepr::Lift(_) => {
-      // instantiate types (we'd need lazy clone here)
-      //
-      todo!()
-    },
-    ScopedTermRepr::Eval(_, _) => todo!(),
     ScopedTermRepr::GlobalRef(_) => todo!(),
     ScopedTermRepr::SubstRef(_) => todo!(),
-    ScopedTermRepr::AtomRef(_) => todo!(),
-    ScopedTermRepr::Star => todo!(),
-    ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::Lambda(_) => todo!(),
-    ScopedTermRepr::SomePt => todo!(),
-    ScopedTermRepr::Void => todo!(),
-    ScopedTermRepr::USort => todo!(),
-    ScopedTermRepr::TypeUnit => todo!(),
-    ScopedTermRepr::ValueUnit => todo!(),
-    ScopedTermRepr::Unknown => todo!(),
+
+    ScopedTermRepr::Tuple(_, _) |
+    ScopedTermRepr::Inl(_) |
+    ScopedTermRepr::Inr(_) |
+    ScopedTermRepr::Lambda(_) |
+    ScopedTermRepr::LambdaHead(_, _) |
+    ScopedTermRepr::Null => {
+      root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+    }
+    ScopedTermRepr::Void => {
+      let ScopedTermRepr::Null = value.get_repr() else {
+        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+        return
+      };
+    }
+    ScopedTermRepr::Pt => {
+      let ScopedTermRepr::Pt = value.get_repr() else {
+        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
+        return
+      };
+    },
   }
 }
-fn check_types_compatible(
-  ctx: &mut ElabEnv,
-  l_ty: ScopedTerm,
-  r_ty: ScopedTerm,
-  l_variable_ty_assocs: &mut TCtx,
-  r_variable_ty_assocs: &mut TCtx,
-  def_ix: DefId
-) -> ElabResult<Outcome<(), ElabProblem>> {
-  let def = ctx.get_def(def_ix);
-  def.log_elab_if_requested(|log|{
-    log.write_str("When checking compatibility of type\n  ").unwrap();
-    render_term_impl(log, &l_ty);
-    log.write_str("\nwith type\n  ").unwrap();
-    render_term_impl(log, &r_ty);
-  });
-  let type_comp_error = || {
-    let msg = format!("{} is not compatible with {}", render_term(&l_ty), render_term(&l_ty));
-    def.log_elab_if_requested(|log| log.write_str(&msg).unwrap());
-    return msg;
-  };
-  match (l_ty.get_repr(), r_ty.get_repr()) {
-    (_, ScopedTermRepr::Eval(h, a)) => {
-      let evaled = h;
-      let () = elim_eval(ctx, None, h.shallow_clone(), a, l_variable_ty_assocs)??;
-      r_ty.assign_from(&evaled);
-      return check_types_compatible(
-        ctx, l_ty, r_ty, l_variable_ty_assocs, r_variable_ty_assocs,def_ix)
-    },
-    (ScopedTermRepr::Eval(h, a), _) => {
-      let evaled = h;
-      let () = elim_eval(ctx, None, h.shallow_clone(), a, l_variable_ty_assocs)??;
-      l_ty.assign_from(&evaled);
-      return check_types_compatible(
-        ctx, l_ty, r_ty, l_variable_ty_assocs, r_variable_ty_assocs, def_ix)
-    },
-    (_, ScopedTermRepr::GlobalRef(id)) => {
-      let def = elim_ref_to_global_def(ctx, *id)??;
-      let def = unsafe {&mut*def.0.get()};
-      r_ty.assign_from(&def.scoped_decl.value);
-      return check_types_compatible(
-        ctx, l_ty, r_ty, l_variable_ty_assocs,r_variable_ty_assocs, def_ix);
-    },
-    (ScopedTermRepr::GlobalRef(id), _) => {
-      let def = elim_ref_to_global_def(ctx, *id)??;
-      let def = unsafe {&mut*def.0.get()};
-      l_ty.assign_from(&def.scoped_decl.value);
-      return check_types_compatible(
-        ctx, l_ty, r_ty, l_variable_ty_assocs, r_variable_ty_assocs, def_ix);
-    },
-    (ScopedTermRepr::LetGroup(_, _), _) => todo!(),
-    (_, ScopedTermRepr::LetGroup(_, _)) => todo!(),
-
-    (_, ScopedTermRepr::SubstRef(rix)) => {
-      let r_ty = &r_variable_ty_assocs.get(*rix).type_;
-      return check_types_compatible(
-        ctx, l_ty, r_ty.shallow_clone(), l_variable_ty_assocs, r_variable_ty_assocs, def_ix);
-    },
-    (ScopedTermRepr::SubstRef(lix), _) => {
-      let l_ty = &l_variable_ty_assocs.get(*lix).type_;
-      return check_types_compatible(
-        ctx, l_ty.shallow_clone(), r_ty, l_variable_ty_assocs, r_variable_ty_assocs, def_ix);
-    },
-    (ScopedTermRepr::AtomRef(l), ScopedTermRepr::AtomRef(r)) => {
-      if l != r {
-        return throw!(ElabProblem::String(type_comp_error()));
-      } else {
-        return emit!(());
-      }
-    },
-    (ScopedTermRepr::Lift(_), _) => {
-      // I dont know how to guarantee if two lifts are compatible
-      todo!()
-    },
-    (ScopedTermRepr::TypeUnit, ScopedTermRepr::TypeUnit) |
-    (ScopedTermRepr::Void, ScopedTermRepr::Void) |
-    (ScopedTermRepr::Star, ScopedTermRepr::Star) => {
-      return emit!(());
-    },
-    (ScopedTermRepr::AtomApp(l, largs), ScopedTermRepr::AtomApp(r, rargs)) => {
-      if l != r { return throw!(ElabProblem::String(type_comp_error())); }
-      for (la, ra) in zip(largs, rargs) {
-        check_types_compatible(
-          ctx, la.shallow_clone(), ra.shallow_clone(),
-          l_variable_ty_assocs, r_variable_ty_assocs, def_ix)??
-      }
-      return emit!(());
-    },
-    (ScopedTermRepr::Star, _) |
-    (_, ScopedTermRepr::Lambda(_)) |
-    (ScopedTermRepr::Lambda(_), _) |
-    (ScopedTermRepr::AtomApp(_, _), _) |
-    (ScopedTermRepr::Void, _) |
-    (ScopedTermRepr::TypeUnit, _) |
-    (ScopedTermRepr::AtomRef(_), _) => {
-      let msg = type_comp_error();
-      return throw!(ElabProblem::String(msg));
-    },
-    (ScopedTermRepr::SomePt, _) |
-    (ScopedTermRepr::ValueUnit, _) |
-    (ScopedTermRepr::USort, _) => unreachable!(),
-    (ScopedTermRepr::Unknown, _) => todo!(),
-  }
+#[derive(Debug, Clone)]
+enum OpenerTerm {
+  Unrefined,
+  Inl(Box<Self>),
+  Inr(Box<Self>),
+  Tuple(Box<Self>, Box<Self>),
+  Pt
 }
-
-fn check_lambda(
-  ctx: &mut ElabEnv,
-  lift: ScopedTerm,
-  lambda: &Lambda,
-  outer_level_binds: &mut TCtx,
-  inner_level_binds: &mut TCtx,
-  def_ix: DefId
-) -> ElabResult<Outcome<(), ElabProblem>> {
-  let Lambda(clauses) = lambda;
-  let clause_len = clauses[0].0.len();
-  for (pexprs, rhs) in clauses {
-    if clause_len != pexprs.len() {
-      let mut str = String::new();
-      for d in pexprs {
-        render_thin_pexpr_impl(&mut str, d)
-      }
-      let msg = format!(
-        "Different pattern count in clauses in lambda\n{}\nexpected {}, got {}\noffender clause\n{}",
-        render_lambda(lambda), clause_len, pexprs.len(), str);
-      return throw!(ElabProblem::String(msg));
-    }
-    let mut openers = Vec::new();
-    let codo = recurse_dependent_clauses(
-      ctx, lift.shallow_clone(), pexprs, &mut openers,
-      outer_level_binds, inner_level_binds, def_ix)??;
-    let repr = codo.get_repr();
-    if let ScopedTermRepr::Star = repr {
-      check_inhabitance(
-          ctx,
-          ScopedTerm::new_from_repr(ScopedTermRepr::USort),
-          rhs.shallow_clone(),
-          inner_level_binds,
-          outer_level_binds,
-          def_ix)??;
-    } else {
-      check_inhabitance(
-          ctx,
-          codo.shallow_clone(),
-          rhs.shallow_clone(),
-          inner_level_binds,
-          outer_level_binds,
-          def_ix)??;
-    }
-  }
-  return emit!(());
-}
-fn recurse_dependent_clauses(
-  ctx: &mut ElabEnv,
-  dep_arrow_ty: ScopedTerm,
-  patterns: &[ThinPExpr],
-  openers: &mut Vec<ScopedTerm>,
-  outer_bindings: &mut TCtx,
-  inner_bindings: &mut TCtx,
-  def_ix: DefId
-) -> ElabResult<Outcome<ScopedTerm, ElabProblem>> {
-  if patterns.is_empty() {
-    return emit!(dep_arrow_ty);
-  }
-  let err_msg = || {
-    let msg = format!("Invalid functional {:?}", dep_arrow_ty);
-    return msg;
-  };
-  match dep_arrow_ty.get_repr() {
-    ScopedTermRepr::Eval(h, a) => { // argument we need to try to open
-      todo!()
+fn elim_app(
+  env: &ElabEnv,
+  root_def: &CheckableDecl,
+  head: &ScopedTerm,
+  args: &Vec<ScopedTerm>,
+  openers: &Vec<OpenerTerm>,
+) {
+  match head.get_repr() {
+    ScopedTermRepr::App(a, b) => {
+      elim_app(env, root_def, a, b, openers);
+      elim_app(env, root_def, a, args, openers);
     },
-    ScopedTermRepr::GlobalRef(gix) => {
-      let decl = elim_ref_to_global_def(ctx, *gix)??;
-      let val = decl.get_value();
-      dep_arrow_ty.assign_from(&val);
-      return recurse_dependent_clauses(
-        ctx, dep_arrow_ty, patterns, openers, outer_bindings, inner_bindings, def_ix);
-    },
-    ScopedTermRepr::Lift(LiftNode(_, p, ty, s)) => {
-      check_inhabitance(
-        ctx,
-        ScopedTerm::new_from_repr(ScopedTermRepr::USort),
-        ty.shallow_clone(),
-        inner_bindings,
-        outer_bindings,
-        def_ix)??;
-      pattern_can_deconstruct_value_of_type(
-        ctx, p, ty.shallow_clone(), outer_bindings, inner_bindings, def_ix)??;
-      let pattern = &patterns[0];
-      pattern_can_deconstruct_value_of_type(
-        ctx, pattern, ty.shallow_clone(), outer_bindings, inner_bindings, def_ix)??;
-
-      let opener = build_term_from_pat(pattern);
-      openers.push(opener);
-      return recurse_dependent_clauses(
-        ctx, s.shallow_clone(), &patterns[1..], openers, outer_bindings, inner_bindings, def_ix);
-    },
-    ScopedTermRepr::AtomApp(atom, args) => {
-      match atom {
-        Atom::Arrow => {
-          let pattern = &patterns[0];
-          let arg = args[0].shallow_clone();
-          pattern_can_deconstruct_value_of_type(
-            ctx, pattern, arg, outer_bindings,inner_bindings, def_ix)??;
-          return recurse_dependent_clauses(
-            ctx, args[1].shallow_clone(), &patterns[1..],
-            openers, outer_bindings, inner_bindings, def_ix);
-        }
-        Atom::And |
-        Atom::Or |
-        Atom::Tilda |
-        Atom::TupleCtor |
-        Atom::Inl |
-        Atom::Inr => {
-          return throw!(ElabProblem::String(err_msg()));
-        },
-      }
-    }
-    ScopedTermRepr::AtomRef(_) |
+    ScopedTermRepr::GlobalRef(_) => todo!(),
     ScopedTermRepr::SubstRef(_) => todo!(),
     ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::Star |
-    ScopedTermRepr::Lambda(_) |
-    ScopedTermRepr::SomePt |
-    ScopedTermRepr::Void |
-    ScopedTermRepr::USort |
-    ScopedTermRepr::TypeUnit |
-    ScopedTermRepr::ValueUnit |
-    ScopedTermRepr::Unknown => {
-      return throw!(ElabProblem::String(err_msg()));
-    },
-  }
-}
-
-fn build_term_from_pat(
-  pattern: &ThinPExpr
-) -> ScopedTerm {
-  match pattern {
-    ThinPExpr::Discard |
-    ThinPExpr::Binder(_) => ScopedTerm::new_from_repr(ScopedTermRepr::Unknown),
-    ThinPExpr::Group(atom, args) => {
-      ScopedTerm::new_from_repr(
-        ScopedTermRepr::AtomApp(*atom, args.iter().map(build_term_from_pat).collect()))
-    },
-    ThinPExpr::Pt => ScopedTerm::new_from_repr(ScopedTermRepr::SomePt),
-  }
-}
-
-#[test] #[ignore]
-fn checker_basic_sanch() {
-  let mut str =
-    "".to_string() +
-    "B : * = () or ();" +
-    "m : (T:*) -> T -> T = { _,v => v };" +
-    "k1 : (T:*) -> T -> T = { T, v => m T v }" +
-    ""
-  ;
-  pad_string(&mut str);
-  let mut p = SourceTextParser::new(str.as_bytes());
-  let defs = p.parse_to_end();
-  match defs {
-    Ok(defs) => {
-      let mut ctx = ScopeCheckCtx::new(str.as_bytes());
-      let decls = scope_check_decls(&mut ctx, &defs);
-      match decls {
-        Ok(decls) => {
-          let mut ctx = build_elab_ctx_from_scoped_defs(decls);
-          let outcome = check_env(&mut ctx);
-          let def = unsafe{&*ctx.defs.decls[2].0.get()};
-          let log = def.elab_trace.as_ref().unwrap();
-          println!("{}", log);
-          // println!("{} {}", def.scoped_decl.type_, def.scoped_decl.value);
-          match outcome {
-            Ok(( )) => println!("horaaayy!"),
-            Err(errs) => {
-              println!("ugh {:#?}", errs)
-            },
-        }
+    ScopedTermRepr::LambdaHead(_, _) => todo!(),
+    ScopedTermRepr::Lambda(cls) => {
+      match elim_lambda(env, root_def, cls, args, openers) {
+        Some(term) => {
+          head.assign_from(&term);
         },
-        Err(err) => {
-          println!("scoping failed\n{:#?}", err)
+        None => panic!("failed to elim app"),
+      }
+    },
+    ScopedTermRepr::Sigma { .. } |
+    ScopedTermRepr::Pi { .. } |
+    ScopedTermRepr::Either(_, _) |
+    ScopedTermRepr::Pair(_, _) |
+    ScopedTermRepr::Arrow(_, _) |
+    ScopedTermRepr::Tuple(_, _) |
+    ScopedTermRepr::Inl(_) |
+    ScopedTermRepr::Inr(_) |
+    ScopedTermRepr::Star |
+    ScopedTermRepr::Void |
+    ScopedTermRepr::Null |
+    ScopedTermRepr::USort |
+    ScopedTermRepr::Pt => unreachable!()
+  }
+}
+#[must_use]
+fn elim_global_ref(
+  env: &ElabEnv,
+  term: &ScopedTerm,
+) -> i32 {
+  let ScopedTermRepr::GlobalRef(ix) = term.get_repr() else {
+    panic!()
+  };
+  let def = env.get_def(*ix);
+  match def.inner().check_state {
+    CheckState::Untouched => {
+      -2
+    },
+    CheckState::Began => {
+      -1
+    },
+    CheckState::Ok => {
+      term.assign_from(&def.get_value());
+      1
+    },
+    CheckState::Bad => {
+      0
+    },
+  }
+}
+
+fn elim_lambda(
+  env: &ElabEnv,
+  root_def: &CheckableDecl,
+  clauses: &Vec<ScopedTerm>,
+  args: &Vec<ScopedTerm>,
+  openers: &Vec<OpenerTerm>,
+) -> Option<ScopedTerm> {
+  let mut bind_items = Vec::new();
+  for clause in clauses {
+    let mut matched = true;
+    match try_match(env, root_def, clause, args, &mut bind_items, openers, &mut matched) {
+      v@Some(_) => {
+        return v;
+      },
+      None => {
+        bind_items.clear();
+        continue
+      },
+    }
+  }
+  return None;
+}
+
+fn try_match(
+  env: &ElabEnv,
+  root_def: &CheckableDecl,
+  clause: &ScopedTerm,
+  args: &[ScopedTerm],
+  bound_values: &mut Vec<ScopedTerm>,
+  openers: &Vec<OpenerTerm>,
+  matched: &mut bool
+) -> Option<ScopedTerm> {
+  match clause.get_repr() {
+    ScopedTermRepr::LambdaHead(pattern, tail) => {
+      try_deconstruct(env, root_def, pattern, &args[0], bound_values, openers, matched);
+      if !*matched { return None }
+      return try_match(env, root_def, tail, &args[1..], bound_values, openers, matched);
+    },
+    _ => {
+      let res = clause.deep_lazy_clone();
+      bind(&res, &bound_values);
+      return Some(res);
+    }
+  }
+}
+fn bind(
+  term: &ScopedTerm,
+  bound: &Vec<ScopedTerm>
+) {
+  match term.get_repr() {
+    ScopedTermRepr::App(head, args) => {
+      bind(head, bound);
+      for arg in args {
+        bind(arg, bound)
+      }
+    },
+    ScopedTermRepr::GlobalRef(_) => (),
+    ScopedTermRepr::SubstRef(ix) => {
+      let bound_value = &bound[ix.get_index()];
+      term.assign_from(bound_value)
+    },
+    ScopedTermRepr::Pi { binder:_, head, tail } |
+    ScopedTermRepr::Sigma { binder:_, head, tail } => {
+      bind(head, bound);
+      bind(tail, bound);
+    },
+    ScopedTermRepr::Tuple(a, b) |
+    ScopedTermRepr::Arrow(a, b) |
+    ScopedTermRepr::Pair(a, b) |
+    ScopedTermRepr::Either(a, b) => {
+      bind(a, bound);
+      bind(b, bound);
+    },
+    ScopedTermRepr::Inl(a) |
+    ScopedTermRepr::Inr(a) => {
+      bind(a, bound)
+    },
+    ScopedTermRepr::LetGroup(_, _) => todo!(),
+    ScopedTermRepr::LambdaHead(_, t) => {
+      bind(t, bound);
+    },
+    ScopedTermRepr::Lambda(clauses) => {
+      for clause in clauses {
+        bind(clause, bound)
+      }
+    },
+    ScopedTermRepr::Star |
+    ScopedTermRepr::Void |
+    ScopedTermRepr::Null |
+    ScopedTermRepr::USort |
+    ScopedTermRepr::Pt => (),
+  }
+}
+fn opener_to_term(
+  opener: &OpenerTerm
+) -> ScopedTerm {
+  match opener {
+    OpenerTerm::Unrefined => {
+      ScopedTerm::new_from_repr(ScopedTermRepr::Null)
+    },
+    OpenerTerm::Inl(v) => {
+      ScopedTerm::new_from_repr(ScopedTermRepr::Inl(opener_to_term(v)))
+    },
+    OpenerTerm::Inr(v) => {
+      ScopedTerm::new_from_repr(ScopedTermRepr::Inr(opener_to_term(v)))
+    },
+    OpenerTerm::Tuple(a, b) => {
+      let a = opener_to_term(a);
+      let b = opener_to_term(b);
+      ScopedTerm::new_from_repr(ScopedTermRepr::Tuple(a, b))
+    },
+    OpenerTerm::Pt => {
+      ScopedTerm::new_from_repr(ScopedTermRepr::Pt)
+    },
+  }
+}
+fn try_deconstruct(
+  env: &ElabEnv,
+  root_def: &CheckableDecl,
+  pattern: &ThinPExpr,
+  term: &ScopedTerm,
+  items: &mut Vec<ScopedTerm>,
+  openers: &Vec<OpenerTerm>,
+  matched: &mut bool
+) {
+  match (pattern, term.get_repr()) {
+    (_, ScopedTermRepr::App(head, args)) => {
+      // rewrite app
+      elim_app(env, root_def, head, args, openers)
+    },
+    (_, ScopedTermRepr::GlobalRef(_)) => {
+      // pull this in
+      todo!()
+    },
+    (_, ScopedTermRepr::SubstRef(ix)) => {
+      // pull from substs
+      let opener = &openers[ix.get_index()];
+      let t = opener_to_term(opener);
+      try_deconstruct(env, root_def, pattern, &t, items, openers, matched)
+    },
+    (_, ScopedTermRepr::LetGroup(_, _)) => {
+      // produce value
+      todo!()
+    },
+    (ThinPExpr::Discard, _) => {
+      ()
+    },
+    (ThinPExpr::Binder(i), _) => {
+      assert!(i.get_index() == items.len());
+      items.push(term.shallow_clone());
+    },
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Pi { .. }) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Sigma { .. }) => {
+      *matched = false;
+    },
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Either(_, _)) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Pair(_, _)) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Void) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Arrow(_, _)) => {
+      *matched = false;
+    },
+    (ThinPExpr::Group(atom, rest), ScopedTermRepr::Tuple(fst, snd)) => {
+      match atom {
+        Atom::TupleCtor => {
+          try_deconstruct(env, root_def, &rest[0], fst, items, openers, matched);
+          if !*matched { return };
+          try_deconstruct(env, root_def, &rest[1], snd, items, openers, matched);
+        },
+        _ => {
+          *matched = false;
+        }
+      }
+    },
+    (ThinPExpr::Pt, a) => {
+      match a {
+        ScopedTermRepr::Pt => (),
+        _ => {
+          *matched = false;
+        }
+      }
+    },
+    (ThinPExpr::Group(atom, val), ScopedTermRepr::Inl(v)) => {
+      match atom {
+        Atom::Inl => {
+          try_deconstruct(env, root_def, &val[0], v, items, openers, matched);
+        },
+        _ => {
+          *matched = false;
+        }
+      }
+    },
+    (ThinPExpr::Group(atom, val), ScopedTermRepr::Inr(v)) => {
+      match atom {
+        Atom::Inr => {
+          try_deconstruct(env, root_def, &val[0], v, items, openers, matched);
+        },
+        _ => {
+          *matched = false;
+        }
+      }
+    },
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Lambda(_)) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Star) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Null) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::USort) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::Pt) |
+    (ThinPExpr::Group(_, _), ScopedTermRepr::LambdaHead(_, _)) => {
+      *matched = false;
+    },
+  }
+}
+
+fn check_pi_tip(
+  env: &ElabEnv,
+  root_def: &CheckableDecl,
+  opener: &mut OpenerTerm,
+  head: &ScopedTerm,
+  pattern: &ThinPExpr,
+) {
+  match head.get_repr() {
+    ScopedTermRepr::Sigma { binder, head, tail } => todo!(),
+    ScopedTermRepr::Pi { binder, head, tail } => todo!(),
+    ScopedTermRepr::Either(l, r) => {
+      match pattern {
+        ThinPExpr::Discard => (),
+        ThinPExpr::Binder(_) => (),
+        ThinPExpr::Group(atom, rest) => {
+          match atom {
+            Atom::Inl => {
+              let mut local_opener = OpenerTerm::Unrefined;
+              check_pi_tip(env, root_def, &mut local_opener, l, &rest[0]);
+              *opener = OpenerTerm::Inl(Box::new(local_opener));
+            },
+            Atom::Inr => {
+              let mut local_opener = OpenerTerm::Unrefined;
+              check_pi_tip(env, root_def, &mut local_opener, r, &rest[0]);
+              *opener = OpenerTerm::Inr(Box::new(local_opener));
+            },
+            _ => {
+              root_def.inner().issues.push(ElabIssue::InvalidBinder);
+              return;
+            }
+          }
+        },
+        ThinPExpr::Pt => {
+          root_def.inner().issues.push(ElabIssue::InvalidBinder);
+          return;
         },
       }
     },
-    Err(err) => {
-      println!("hell {:#?}", err)
+    ScopedTermRepr::Pair(l, r) => {
+      match pattern {
+        ThinPExpr::Discard => (),
+        ThinPExpr::Binder(_) => (),
+        ThinPExpr::Group(atom, rest) => {
+          match atom {
+            Atom::TupleCtor => {
+              let mut local_opener_l = OpenerTerm::Unrefined;
+              check_pi_tip(env, root_def, &mut local_opener_l, l, &rest[0]);
+              let mut local_opener_r = OpenerTerm::Unrefined;
+              check_pi_tip(env, root_def, &mut local_opener_r, r, &rest[1]);
+              *opener = OpenerTerm::Tuple(Box::new(local_opener_l), Box::new(local_opener_r));
+            }
+            _ => {
+              root_def.inner().issues.push(ElabIssue::InvalidBinder);
+              return;
+            }
+          }
+        },
+        ThinPExpr::Pt => {
+          root_def.inner().issues.push(ElabIssue::InvalidBinder);
+          return;
+        },
+      }
     },
+    ScopedTermRepr::Arrow(_, _) => {
+      match pattern {
+        ThinPExpr::Discard => (),
+        ThinPExpr::Binder(_) => (),
+        _ => {
+          root_def.inner().issues.push(ElabIssue::InvalidBinder);
+          return;
+        }
+      }
+    },
+    ScopedTermRepr::Star => {
+      match pattern {
+        ThinPExpr::Discard => (),
+        ThinPExpr::Binder(_) => (),
+        _ => {
+          root_def.inner().issues.push(ElabIssue::InvalidBinder);
+          return;
+        }
+      }
+    },
+    ScopedTermRepr::Void => {
+      root_def.inner().issues.push(ElabIssue::InvalidBinder);
+      return;
+    },
+    ScopedTermRepr::Pt => {
+      match pattern {
+        ThinPExpr::Discard |
+        ThinPExpr::Binder(_) |
+        ThinPExpr::Pt => {
+          *opener = OpenerTerm::Pt;
+        },
+        _ => {
+          root_def.inner().issues.push(ElabIssue::InvalidBinder);
+          return;
+        }
+      }
+    },
+
+    ScopedTermRepr::App(_, _) => todo!(),
+    ScopedTermRepr::GlobalRef(_) => todo!(),
+    ScopedTermRepr::SubstRef(_) => todo!(),
+    ScopedTermRepr::LetGroup(_, _) => todo!(),
+
+    ScopedTermRepr::Tuple(_, _) => todo!(),
+    ScopedTermRepr::Inl(_) => todo!(),
+    ScopedTermRepr::Inr(_) => todo!(),
+    ScopedTermRepr::Lambda(_) => todo!(),
+    ScopedTermRepr::USort => unreachable!(),
+    ScopedTermRepr::Null => {
+      root_def.inner().issues.push(ElabIssue::InvalidBinder);
+      return;
+    },
+    ScopedTermRepr::LambdaHead(_, _) => todo!(),
   }
 }
+
+#[test]
+fn build_env() {
+  let mut text =
+    "a : (m: () or ()) -> { inl () => Void, inr () => () } m = { inl () => !, inr () => () }".to_string() +
+    ""
+  ;
+  pad_string(&mut text);
+  let mut parser = SourceTextParser::new(text.as_bytes());
+  let raw_decls = match parser.parse_to_end() {
+    Ok(raw_decls) => raw_decls,
+    Err(err) => panic!("{:?}", err),
+  };
+  let mut scoped_checker = ScopeCheckCtx::new(text.as_bytes());
+  let scoped = match scope_check_decls(&mut scoped_checker, &raw_decls) {
+    Ok(scoped) => scoped,
+    Err(err) => panic!("{:?}", err),
+  };
+  let elab_env = ElabEnv::new_from_scoped_defs(scoped);
+  elab(&elab_env);
+  println!("{:#?}", elab_env);
+
+}
+

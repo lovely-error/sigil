@@ -1,7 +1,8 @@
 
-use std::{str::{FromStr}, mem::{align_of, MaybeUninit, transmute, size_of, ManuallyDrop}, ptr::{addr_of_mut, copy_nonoverlapping, null_mut, addr_of}, simd::{self, u8x8, SimdPartialEq, SimdPartialOrd, u8x4, Mask, Simd, u32x4}, marker::PhantomData, any::Any};
 
-use regex::{RegexSet, Regex};
+use core::mem::{align_of, transmute, size_of};
+use core::simd::prelude::{SimdPartialEq as _, SimdPartialOrd as _};
+use core::simd::{u8x4, Mask, Simd, u32x4};
 
 use crate::{garbage, utils::{aligned_for, offset_to_higher_multiple, PageSource}, root_alloc::{Block4KPtr, RootAllocator}, interlacing_alloc::{InterlaceAllocator, SeqvRef, InterlacedSeqvItemRef, SeqvReader}, parser::resolve_precendece};
 
@@ -692,7 +693,7 @@ fn render_raw_pexpr(pexpr: &RawPExpr, chars_ptr: *const u8, write_target: &mut S
 
 #[test] #[ignore]
 fn align_simd() {
-  println!("{} {}", align_of::<u8x8>(), align_of::<Simd<u64, 32>>())
+  println!("{} {}", align_of::<core::simd::u8x8>(), align_of::<Simd<u64, 32>>())
 }
 
 #[test] #[ignore]
@@ -708,7 +709,7 @@ fn letter_distance() {
 #[test] #[ignore]
 fn ident_parser1() {
   let s = " \nazZ_Z_ZZ_:a_Z_A_z__";
-  let mut str = String::from_str(s).unwrap();
+  let mut str = <String as core::str::FromStr>::from_str(s).unwrap();
   pad_string(&mut str);
   let mut parser = SourceTextParser::new(str.as_bytes());
   parser.skip_trivia();

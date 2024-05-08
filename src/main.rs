@@ -8,7 +8,8 @@
 mod root_alloc;
 mod utils;
 mod loopbuffer;
-mod driver;
+
+
 mod array;
 mod stable_map;
 
@@ -18,7 +19,7 @@ mod sema;
 
 mod coordinated_killing;
 
-mod mpsc;
+// mod mpsc;
 
 mod lexer;
 
@@ -33,5 +34,5 @@ mod checker;
 
 
 fn main() {
-  cli::main()
+  cli::run()
 }

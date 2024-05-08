@@ -31,6 +31,7 @@ impl <Key: Hash + Eq + Clone, Value> StableMap<Key, Value> {
     // we may mark some entries as 'stop point' so that future shadow kill crusades will
     // not need to go deep every time this procedure runs.
     // shadow killing mayb also be run as async computation, it wont block things
+    if needs_drop::<Value>() { todo!() }
   }
   fn item_count(&self) -> usize { unsafe {
     let this = &mut *self.0.get();

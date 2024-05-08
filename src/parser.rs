@@ -142,21 +142,28 @@ fn resolve_app_pexpr(inp: &[u8], pexpr: &[RawPExpr]) -> Maybe<RefinedPExpr> {
   };
   return Ok(RefinedPExpr::Group(head, args))
 }
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LiftKind {
-  Arrow, And
-}
+
 #[derive(Debug, Clone)]
 pub enum PrecedenceResolvedTExpr {
   App(Box<Self>, Vec<Self>),
   Ref(CharsData),
   AtomRef(Atom),
-  Lift(LiftKind, RefinedPExpr, Box<Self>, Box<Self>),
+  Sigma {
+    binder: RefinedPExpr,
+    head: Box<Self>,
+    tail: Box<Self>
+  },
+  Pi {
+    binder: RefinedPExpr,
+    head: Box<Self>,
+    tail: Box<Self>
+  },
   Star,
   Let(Vec<(RefinedPExpr, Self, Self)>, Box<Self>),
   Lambda(Vec<(Vec<RefinedPExpr>, Self)>),
   Pt,
   Void,
+  Null
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Atom { And, Or, Arrow, Tilda, TupleCtor, Inl, Inr }
@@ -207,11 +214,17 @@ fn split_tokens(
         RawTExpr::InfixOp(infop) => {
           match infop {
             InfixOp::And => return Ok(
-              PrecedenceResolvedTExpr::Lift(
-                LiftKind::And, rpexpr, Box::new(head), Box::new(tail))),
+              PrecedenceResolvedTExpr::Sigma {
+                binder: rpexpr,
+                head: Box::new(head),
+                tail: Box::new(tail),
+              }),
             InfixOp::Arrow => return Ok(
-              PrecedenceResolvedTExpr::Lift(
-                LiftKind::Arrow, rpexpr, Box::new(head), Box::new(tail))),
+              PrecedenceResolvedTExpr::Pi {
+                binder: rpexpr,
+                head: Box::new(head),
+                tail: Box::new(tail),
+            }),
             InfixOp::Or |
             InfixOp::Tilda => return Err(PrecedenceResolutionFailure::OrderError),
           }
@@ -359,7 +372,7 @@ fn resolve_singular(
     },
     RawTExpr::Star => return Ok(PrecedenceResolvedTExpr::Star),
     RawTExpr::Pt => return Ok(PrecedenceResolvedTExpr::Pt),
-    RawTExpr::EMark => return Ok(PrecedenceResolvedTExpr::Void),
+    RawTExpr::EMark => return Ok(PrecedenceResolvedTExpr::Null),
   }
 }
 
