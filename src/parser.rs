@@ -163,7 +163,6 @@ pub enum PrecedenceResolvedTExpr {
   Lambda(Vec<(Vec<RefinedPExpr>, Self)>),
   Pt,
   Void,
-  Null
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Atom { And, Or, Arrow, Tilda, TupleCtor, Inl, Inr }
@@ -372,7 +371,6 @@ fn resolve_singular(
     },
     RawTExpr::Star => return Ok(PrecedenceResolvedTExpr::Star),
     RawTExpr::Pt => return Ok(PrecedenceResolvedTExpr::Pt),
-    RawTExpr::EMark => return Ok(PrecedenceResolvedTExpr::Null),
   }
 }
 

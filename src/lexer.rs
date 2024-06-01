@@ -436,11 +436,6 @@ impl <'i> SourceTextParser<'i> {
           self.skip_trivia();
           continue;
         },
-        Letters::EMARK => {
-          self.skip(1);
-          components.push(RawTExpr::EMark);
-          continue;
-        }
         _ => {
           if let Some(infix) = self.parse_infix_op() {
             let node = RawTExpr::InfixOp(infix);
@@ -580,7 +575,6 @@ pub enum RawTExpr {
   InfixOp(InfixOp),
   Star,
   Pt,
-  EMark
 }
 
 fn render_raw_texpr(texpr: &RawTExpr, chars_ptr: *const u8, write_target: &mut String) {
@@ -655,7 +649,6 @@ fn render_raw_texpr(texpr: &RawTExpr, chars_ptr: *const u8, write_target: &mut S
       write_target.push_str("}")
     },
     RawTExpr::Pt => write_target.push_str("()"),
-    RawTExpr::EMark => write_target.push('!')
   }
 }
 fn render_raw_pexpr(pexpr: &RawPExpr, chars_ptr: *const u8, write_target: &mut String) {

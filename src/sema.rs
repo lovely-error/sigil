@@ -261,7 +261,6 @@ pub enum ScopedTermRepr {
   Lambda(Vec<ScopedTerm>),
   Star,
   Void,
-  Null,
   USort,
   Pt,
 }
@@ -306,7 +305,6 @@ impl ScopedTermRepr {
         (*a.0.get()).repr.release_reference();
         (*b.0.get()).repr.release_reference();
       },
-      ScopedTermRepr::Null => (),
       ScopedTermRepr::Lambda(cls) => {
         for i in cls {
           (*i.0.get()).repr.release_reference();
@@ -365,9 +363,6 @@ impl ScopedTermRepr {
       }
       ScopedTermRepr::Pair(a, b) => {
         return ScopedTermRepr::Pair(a.deep_lazy_clone(), b.deep_lazy_clone());
-      },
-      ScopedTermRepr::Null => {
-        return ScopedTermRepr::Null;
       },
       ScopedTermRepr::Lambda(cls) => {
         ScopedTermRepr::Lambda(cls.iter().map(|e|e.deep_lazy_clone()).collect())
@@ -480,9 +475,6 @@ pub fn render_term_impl(str:&mut dyn Write, term: &ScopedTerm) {
     ScopedTermRepr::Inr(b) => {
       str.write_str("inr ").unwrap();
       render_term_impl(str, b);
-    },
-    ScopedTermRepr::Null => {
-      str.write_char('!').unwrap();
     },
     ScopedTermRepr::Lambda(cls) => {
       str.write_str("{ ").unwrap();
@@ -796,12 +788,11 @@ fn check_scope(
     PrecedenceResolvedTExpr::Pt => return Some(ScopedTerm::new_from_repr(ScopedTermRepr::Pt)),
     PrecedenceResolvedTExpr::Void => return Some(ScopedTerm::new_from_repr(ScopedTermRepr::Void)),
     PrecedenceResolvedTExpr::AtomRef(_) => todo!(),
-    PrecedenceResolvedTExpr::Null => return Some(ScopedTerm::new_from_repr(ScopedTermRepr::Null)),
   }
 }
 fn change_lambda_repr(cls: &[ThinPExpr], rhs: ScopedTerm, index: usize) -> ScopedTerm {
   let head = &cls[0];
-  let rest = &cls[index+1..];
+  let rest = &cls[1..];
   if rest.is_empty() {
     return ScopedTerm::new_from_repr(ScopedTermRepr::LambdaHead(head.clone(), rhs));
   } else {

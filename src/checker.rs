@@ -1,4 +1,4 @@
-use core::{cell::UnsafeCell, fmt::{Debug, Write}, sync::atomic::compiler_fence};
+use core::{cell::UnsafeCell, fmt::{Debug, Write}, future::{poll_fn, Future}, mem::transmute, pin::Pin, sync::atomic::compiler_fence, task::Poll};
 use std::{borrow::Cow, collections::{HashSet, VecDeque}, iter::zip, ptr::addr_of_mut, rc::Rc};
 
 use crate::{parser::{Atom, RefinedPExpr}, sema::{ScopedDecl, GenericError, DefId, ScopedTerm, ThinPExpr, Lambda, ScopeCheckCtx, scope_check_decls, RcBox, ScopedTermRepr, render_term, render_thin_pexpr_impl, render_lambda, render_thin_pexpr, render_args, render_decl_impl, render_global_ix, render_term_impl, render_lambda_impl, render_args_impl, SubstIndex}, utils::{Outcome, inside_out}, lexer::{pad_string, SourceTextParser}};
@@ -6,7 +6,6 @@ use crate::{parser::{Atom, RefinedPExpr}, sema::{ScopedDecl, GenericError, DefId
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CheckState {
-  Untouched,
   Began,
   Ok,
   Bad
@@ -16,34 +15,42 @@ enum CheckState {
 enum ElabIssue {
   UnproductiveCycle(Vec<DefId>),
   InvalidInhabitance,
-  InvalidBinder
+  InvalidBinder,
+  UnsupportedBinder,
+  TypeMismatch {
+    rep: String
+  },
+  BadDef,
+  InvalidApplication
 }
 
 struct CheckableDecl(UnsafeCell<CheckableDeclInner>);
-#[derive(Debug)]
+
 struct CheckableDeclInner {
   scoped_decl: ScopedDecl,
-  check_state: CheckState,
+  check_state: Option<CheckState>,
   elab_trace: Option<String>,
-  issues: Vec<ElabIssue>
+  issues: Vec<ElabIssue>,
+  dependants: Vec<ElabItem>
 }
 impl CheckableDecl {
   fn new(
     sd: ScopedDecl
   ) -> Self {
     Self(UnsafeCell::new(CheckableDeclInner {
-      scoped_decl: sd, check_state: CheckState::Untouched, elab_trace: None,
-      issues: vec![]
+      scoped_decl: sd, check_state: None, elab_trace: None,
+      issues: vec![],
+      dependants: vec![]
     }))
   }
   fn inner(&self) -> &mut CheckableDeclInner {
     unsafe { &mut*self.0.get() }
   }
-  fn get_value(&self) -> ScopedTerm {
-    unsafe{(*self.0.get()).scoped_decl.value.shallow_clone()}
+  fn get_value(&self) -> &ScopedTerm {
+    &self.inner().scoped_decl.value
   }
-  fn get_type(&self) -> ScopedTerm {
-    unsafe{(*self.0.get()).scoped_decl.type_.shallow_clone()}
+  fn get_type(&self) -> &ScopedTerm {
+    &self.inner().scoped_decl.type_
   }
   fn log_elab_if_requested(&self, op: impl FnOnce(&mut dyn Write)) {
     let inner = unsafe {&mut*self.0.get()};
@@ -55,7 +62,13 @@ impl CheckableDecl {
 }
 impl Debug for CheckableDecl {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      f.debug_tuple("CheckableDecl").field(unsafe{&*self.0.get()}).finish()
+    let inner = self.inner();
+    let mut s = f.debug_tuple("CheckableDecl");
+    s.field(&inner.check_state);
+    s.field(&inner.elab_trace);
+    s.field(&inner.issues);
+    s.field(&inner.scoped_decl);
+    s.finish()
   }
 }
 #[derive(Debug)]
@@ -63,15 +76,20 @@ struct ScopedEnv {
   decls: Vec<CheckableDecl>
 }
 struct ElabItem {
-
+  repr: Box<dyn Future<Output = ()>>,
+  start_decl: DefId
 }
-struct ElabEnv {
+
+struct ElabEnv(UnsafeCell<ElabEnvInner>);
+struct ElabEnvInner {
   defs: ScopedEnv,
-  postponed: VecDeque<ElabItem>,
 }
 impl ElabEnv {
+  fn inner(&self) -> &mut ElabEnvInner {
+    unsafe { &mut *self.0.get() }
+  }
   fn get_def(&self, gix: DefId) -> &CheckableDecl {
-    &self.defs.decls[gix.get_def_index()]
+    &self.inner().defs.decls[gix.get_def_index()]
   }
   fn new_from_scoped_defs(defs: Vec<ScopedDecl>) -> ElabEnv {
     let checakbles =
@@ -79,13 +97,13 @@ impl ElabEnv {
       .into_iter()
       .map(CheckableDecl::new)
       .collect();
-    ElabEnv { defs: ScopedEnv { decls: checakbles }, postponed: VecDeque::new() }
+    ElabEnv(UnsafeCell::new(ElabEnvInner { defs: ScopedEnv { decls: checakbles } }))
   }
 }
 impl Debug for ElabEnv {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     let mut s = f.debug_struct("ElabEnv");
-    s.field("defs", &self.defs);
+    s.field("defs", &self.inner().defs);
     s.finish()
   }
 }
@@ -105,6 +123,9 @@ fn check_productivity(
       let reappears = trace.contains(id);
       if reappears { // this is a cycle.
         if !*found_ground_terms { // which produces no ground terms
+          for item in &trace {
+            ctx.get_def(*item).inner().check_state = Some(CheckState::Bad);
+          }
           start_decl.inner().issues.push(ElabIssue::UnproductiveCycle(trace));
         }
         return;
@@ -140,7 +161,6 @@ fn check_productivity(
       *found_ground_terms = true;
       return;
     },
-    ScopedTermRepr::Null => (),
     ScopedTermRepr::USort |
     ScopedTermRepr::Star => (),
     ScopedTermRepr::LambdaHead(_, tail) => {
@@ -149,570 +169,351 @@ fn check_productivity(
   }
 }
 
-fn elab(
-  env: &ElabEnv
+fn begin_elab(
+  env: &ElabEnv,
+  thunks: &mut VecDeque<ElabItem>,
 ) {
-  for item in &env.defs.decls {
+  let inner = env.inner();
+  for item in &inner.defs.decls {
+    let item_inner = item.inner();
+    item_inner.check_state = Some(CheckState::Began);
+
     let mut found_ground = false;
     let trace = vec![item.inner().scoped_decl.index];
     check_productivity(env, item, &item.inner().scoped_decl.value, &mut found_ground, trace);
 
-    // let u = ScopedTerm::new_from_repr(ScopedTermRepr::USort);
-    // check_inhabitance(env, item, &u, &item.get_type());
-    check_inhabitance(env, item, &item.get_type(), &item.get_value(), &mut Vec::new());
+    let cpy: &ElabEnv = unsafe { transmute(env) };
+    let item = unsafe { transmute(item) };
+    let thunk = async move {
+      match check(cpy, item, item.get_type(), item.get_value()).await {
+        Ok(_) => {
+          let inner = item.inner();
+          inner.check_state = Some(CheckState::Ok);
+        },
+        Err(err) => {
+          let inner = item.inner();
+          inner.check_state = Some(CheckState::Bad);
+          inner.issues.push(err);
+        },
+      };
+    };
+    thunks.push_back(ElabItem { repr: Box::new(thunk), start_decl: item_inner.scoped_decl.index })
   }
 }
 
-fn check_inhabitance(
+struct PollCtx {
+  dep: Option<PollCtxDepencency>
+}
+impl PollCtx {
+  fn put_dependency(&mut self, dep: PollCtxDepencency) {
+    self.dep = Some(dep);
+  }
+}
+enum PollCtxDepencency {
+  UnfinishedDef(DefId),
+}
+
+fn run_elab(
   env: &ElabEnv,
-  root_def: &CheckableDecl,
-  type_: &ScopedTerm,
-  value: &ScopedTerm,
-  openers: &mut Vec<OpenerTerm>
+  postponed: &mut VecDeque<ElabItem>,
 ) {
-  match type_.get_repr() {
-    t@(ScopedTermRepr::USort | ScopedTermRepr::Star) => {
-      match value.get_repr() {
-        ScopedTermRepr::Pi { binder:_, head, tail } |
-        ScopedTermRepr::Sigma { binder:_, head, tail } => {
-          // check that binder is valid
-          check_inhabitance(env, root_def, type_, head, openers);
-          check_inhabitance(env, root_def, type_, tail, openers);
-        },
-        ScopedTermRepr::Either(a, b) |
-        ScopedTermRepr::Pair(a, b) |
-        ScopedTermRepr::Arrow(a, b) => {
-          check_inhabitance(env, root_def, type_, a, openers);
-          check_inhabitance(env, root_def, type_, b, openers);
-        },
-        ScopedTermRepr::Star => {
-          if let ScopedTermRepr::Star = t {
-            root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-          }
-        },
-        ScopedTermRepr::Void |
-        ScopedTermRepr::Pt => (),
-
-        ScopedTermRepr::GlobalRef(_) => todo!(),
-        ScopedTermRepr::App(_, _) => todo!(),
-        ScopedTermRepr::SubstRef(_) => todo!(),
-        ScopedTermRepr::LetGroup(_, _) => todo!(),
-
-        ScopedTermRepr::Lambda(_) |
-        ScopedTermRepr::Inl(_) |
-        ScopedTermRepr::Inr(_) |
-        ScopedTermRepr::Null |
-        ScopedTermRepr::LambdaHead(_, _) |
-        ScopedTermRepr::Tuple(_, _) => {
-          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-        },
-        ScopedTermRepr::USort => unreachable!(),
-      }
-    },
-    ScopedTermRepr::Arrow(head, tail) => {
-      match value.get_repr() {
-        ScopedTermRepr::Lambda(clauses) => {
-          for clause in clauses {
-            let mut copy = openers.clone();
-            check_inhabitance(env, root_def, type_, clause, &mut copy);
-          }
-        },
-        ScopedTermRepr::LambdaHead(decon_pat, rest) => {
-          check_pi_tip(env, root_def, openers.last_mut().unwrap(), head, decon_pat);
-          check_inhabitance(env, root_def, tail, rest, openers)
-        }
-        _ => {
-          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-          return;
-        }
-      }
-    }
-    ScopedTermRepr::Pi { binder:_, head, tail } => {
-      match value.get_repr() {
-        ScopedTermRepr::Lambda(clauses) => {
-          for clause in clauses {
-            let mut copy = openers.clone();
-            check_inhabitance(env, root_def, type_, clause, &mut copy);
-          }
-        },
-        ScopedTermRepr::LambdaHead(decon_pat, rest) => {
-          openers.push(OpenerTerm::Unrefined);
-          check_pi_tip(env, root_def, openers.last_mut().unwrap(), head, decon_pat);
-          check_inhabitance(env, root_def, tail, rest, openers)
-        }
-        _ => {
-          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-          return;
-        }
-      }
-    },
-    ScopedTermRepr::Sigma { binder, head, tail } => {
-      let ScopedTermRepr::Tuple(fst, snd) = value.get_repr() else {
-        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-        return;
-      };
-      todo!()
-    },
-    ScopedTermRepr::Pair(_, _) => {
-      let ScopedTermRepr::Tuple(_, _) = value.get_repr() else {
-        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-        return;
-      };
-      todo!()
-    },
-    ScopedTermRepr::Either(l, r) => {
-      match value.get_repr() {
-        ScopedTermRepr::Inl(v) => {
-          check_inhabitance(env, root_def, l, v, openers);
-        },
-        ScopedTermRepr::Inr(v) => {
-          check_inhabitance(env, root_def, r, v, openers);
-        },
-        _ => {
-          root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-          return;
-        }
-      }
-    },
-    ScopedTermRepr::App(tar, args) => {
-      let tar = tar.deep_lazy_clone();
-      elim_app(env, root_def, &tar, args, openers);
-      check_inhabitance(env, root_def, &tar, value, openers)
-    },
-    ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::GlobalRef(_) => todo!(),
-    ScopedTermRepr::SubstRef(_) => todo!(),
-
-    ScopedTermRepr::Tuple(_, _) |
-    ScopedTermRepr::Inl(_) |
-    ScopedTermRepr::Inr(_) |
-    ScopedTermRepr::Lambda(_) |
-    ScopedTermRepr::LambdaHead(_, _) |
-    ScopedTermRepr::Null => {
-      root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-    }
-    ScopedTermRepr::Void => {
-      let ScopedTermRepr::Null = value.get_repr() else {
-        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-        return
-      };
-    }
-    ScopedTermRepr::Pt => {
-      let ScopedTermRepr::Pt = value.get_repr() else {
-        root_def.inner().issues.push(ElabIssue::InvalidInhabitance);
-        return
-      };
-    },
-  }
-}
-#[derive(Debug, Clone)]
-enum OpenerTerm {
-  Unrefined,
-  Inl(Box<Self>),
-  Inr(Box<Self>),
-  Tuple(Box<Self>, Box<Self>),
-  Pt
-}
-fn elim_app(
-  env: &ElabEnv,
-  root_def: &CheckableDecl,
-  head: &ScopedTerm,
-  args: &Vec<ScopedTerm>,
-  openers: &Vec<OpenerTerm>,
-) {
-  match head.get_repr() {
-    ScopedTermRepr::App(a, b) => {
-      elim_app(env, root_def, a, b, openers);
-      elim_app(env, root_def, a, args, openers);
-    },
-    ScopedTermRepr::GlobalRef(_) => todo!(),
-    ScopedTermRepr::SubstRef(_) => todo!(),
-    ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::LambdaHead(_, _) => todo!(),
-    ScopedTermRepr::Lambda(cls) => {
-      match elim_lambda(env, root_def, cls, args, openers) {
-        Some(term) => {
-          head.assign_from(&term);
-        },
-        None => panic!("failed to elim app"),
-      }
-    },
-    ScopedTermRepr::Sigma { .. } |
-    ScopedTermRepr::Pi { .. } |
-    ScopedTermRepr::Either(_, _) |
-    ScopedTermRepr::Pair(_, _) |
-    ScopedTermRepr::Arrow(_, _) |
-    ScopedTermRepr::Tuple(_, _) |
-    ScopedTermRepr::Inl(_) |
-    ScopedTermRepr::Inr(_) |
-    ScopedTermRepr::Star |
-    ScopedTermRepr::Void |
-    ScopedTermRepr::Null |
-    ScopedTermRepr::USort |
-    ScopedTermRepr::Pt => unreachable!()
-  }
-}
-#[must_use]
-fn elim_global_ref(
-  env: &ElabEnv,
-  term: &ScopedTerm,
-) -> i32 {
-  let ScopedTermRepr::GlobalRef(ix) = term.get_repr() else {
-    panic!()
+  let mut poll_ctx = PollCtx {
+    dep: None
   };
-  let def = env.get_def(*ix);
-  match def.inner().check_state {
-    CheckState::Untouched => {
-      -2
-    },
-    CheckState::Began => {
-      -1
-    },
-    CheckState::Ok => {
-      term.assign_from(&def.get_value());
-      1
-    },
-    CheckState::Bad => {
-      0
-    },
-  }
-}
 
-fn elim_lambda(
-  env: &ElabEnv,
-  root_def: &CheckableDecl,
-  clauses: &Vec<ScopedTerm>,
-  args: &Vec<ScopedTerm>,
-  openers: &Vec<OpenerTerm>,
-) -> Option<ScopedTerm> {
-  let mut bind_items = Vec::new();
-  for clause in clauses {
-    let mut matched = true;
-    match try_match(env, root_def, clause, args, &mut bind_items, openers, &mut matched) {
-      v@Some(_) => {
-        return v;
+  while let Some(mut thunk) = postponed.pop_front() {
+    let pined = unsafe { core::pin::Pin::new_unchecked(thunk.repr.as_mut()) };
+    match Future::poll(pined, unsafe { transmute(&mut poll_ctx) }) {
+      Poll::Ready(()) => {
+        let i = env.get_def(thunk.start_decl).inner();
+        i.check_state = Some(CheckState::Ok);
+        while let Some(dep) = i.dependants.pop() {
+          postponed.push_front(dep)
+        }
       },
-      None => {
-        bind_items.clear();
-        continue
+      Poll::Pending => {
+        match poll_ctx.dep.take() {
+          Some(PollCtxDepencency::UnfinishedDef(id)) => {
+            env.get_def(id).inner().dependants.push(thunk);
+          },
+          None => unreachable!(),
+        }
       },
     }
   }
-  return None;
 }
 
-fn try_match(
-  env: &ElabEnv,
-  root_def: &CheckableDecl,
-  clause: &ScopedTerm,
-  args: &[ScopedTerm],
-  bound_values: &mut Vec<ScopedTerm>,
-  openers: &Vec<OpenerTerm>,
-  matched: &mut bool
-) -> Option<ScopedTerm> {
-  match clause.get_repr() {
-    ScopedTermRepr::LambdaHead(pattern, tail) => {
-      try_deconstruct(env, root_def, pattern, &args[0], bound_values, openers, matched);
-      if !*matched { return None }
-      return try_match(env, root_def, tail, &args[1..], bound_values, openers, matched);
-    },
-    _ => {
-      let res = clause.deep_lazy_clone();
-      bind(&res, &bound_values);
-      return Some(res);
+fn get_def<'a>(ctx: &'a ElabEnv, defid: DefId) -> impl Future<Output = Result<&'a CheckableDecl, ()>> + 'a {
+  poll_fn(move |pctx| {
+    let pctx: &mut PollCtx = unsafe { transmute(pctx) };
+    let def = ctx.get_def(defid);
+    let inner = def.inner();
+    match inner.check_state.unwrap() {
+      CheckState::Began => {
+        pctx.put_dependency(PollCtxDepencency::UnfinishedDef(defid));
+        return Poll::Pending;
+      },
+      CheckState::Ok => {
+        return Poll::Ready(Ok(def))
+      },
+      CheckState::Bad => return Poll::Ready(Err(())),
     }
-  }
+  })
 }
-fn bind(
-  term: &ScopedTerm,
-  bound: &Vec<ScopedTerm>
-) {
-  match term.get_repr() {
-    ScopedTermRepr::App(head, args) => {
-      bind(head, bound);
-      for arg in args {
-        bind(arg, bound)
-      }
-    },
-    ScopedTermRepr::GlobalRef(_) => (),
-    ScopedTermRepr::SubstRef(ix) => {
-      let bound_value = &bound[ix.get_index()];
-      term.assign_from(bound_value)
-    },
-    ScopedTermRepr::Pi { binder:_, head, tail } |
-    ScopedTermRepr::Sigma { binder:_, head, tail } => {
-      bind(head, bound);
-      bind(tail, bound);
-    },
-    ScopedTermRepr::Tuple(a, b) |
-    ScopedTermRepr::Arrow(a, b) |
-    ScopedTermRepr::Pair(a, b) |
-    ScopedTermRepr::Either(a, b) => {
-      bind(a, bound);
-      bind(b, bound);
-    },
-    ScopedTermRepr::Inl(a) |
-    ScopedTermRepr::Inr(a) => {
-      bind(a, bound)
-    },
-    ScopedTermRepr::LetGroup(_, _) => todo!(),
-    ScopedTermRepr::LambdaHead(_, t) => {
-      bind(t, bound);
-    },
-    ScopedTermRepr::Lambda(clauses) => {
-      for clause in clauses {
-        bind(clause, bound)
-      }
-    },
-    ScopedTermRepr::Star |
-    ScopedTermRepr::Void |
-    ScopedTermRepr::Null |
-    ScopedTermRepr::USort |
-    ScopedTermRepr::Pt => (),
-  }
+
+struct OpenerCtx {
+  items: Vec<Option<ThinPExpr>>
 }
-fn opener_to_term(
-  opener: &OpenerTerm
-) -> ScopedTerm {
-  match opener {
-    OpenerTerm::Unrefined => {
-      ScopedTerm::new_from_repr(ScopedTermRepr::Null)
-    },
-    OpenerTerm::Inl(v) => {
-      ScopedTerm::new_from_repr(ScopedTermRepr::Inl(opener_to_term(v)))
-    },
-    OpenerTerm::Inr(v) => {
-      ScopedTerm::new_from_repr(ScopedTermRepr::Inr(opener_to_term(v)))
-    },
-    OpenerTerm::Tuple(a, b) => {
-      let a = opener_to_term(a);
-      let b = opener_to_term(b);
-      ScopedTerm::new_from_repr(ScopedTermRepr::Tuple(a, b))
-    },
-    OpenerTerm::Pt => {
-      ScopedTerm::new_from_repr(ScopedTermRepr::Pt)
-    },
+impl OpenerCtx {
+  fn new() -> Self {
+    Self { items: Vec::new() }
   }
-}
-fn try_deconstruct(
-  env: &ElabEnv,
-  root_def: &CheckableDecl,
-  pattern: &ThinPExpr,
-  term: &ScopedTerm,
-  items: &mut Vec<ScopedTerm>,
-  openers: &Vec<OpenerTerm>,
-  matched: &mut bool
-) {
-  match (pattern, term.get_repr()) {
-    (_, ScopedTermRepr::App(head, args)) => {
-      // rewrite app
-      elim_app(env, root_def, head, args, openers)
-    },
-    (_, ScopedTermRepr::GlobalRef(_)) => {
-      // pull this in
-      todo!()
-    },
-    (_, ScopedTermRepr::SubstRef(ix)) => {
-      // pull from substs
-      let opener = &openers[ix.get_index()];
-      let t = opener_to_term(opener);
-      try_deconstruct(env, root_def, pattern, &t, items, openers, matched)
-    },
-    (_, ScopedTermRepr::LetGroup(_, _)) => {
-      // produce value
-      todo!()
-    },
-    (ThinPExpr::Discard, _) => {
-      ()
-    },
-    (ThinPExpr::Binder(i), _) => {
-      assert!(i.get_index() == items.len());
-      items.push(term.shallow_clone());
-    },
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Pi { .. }) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Sigma { .. }) => {
-      *matched = false;
-    },
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Either(_, _)) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Pair(_, _)) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Void) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Arrow(_, _)) => {
-      *matched = false;
-    },
-    (ThinPExpr::Group(atom, rest), ScopedTermRepr::Tuple(fst, snd)) => {
-      match atom {
-        Atom::TupleCtor => {
-          try_deconstruct(env, root_def, &rest[0], fst, items, openers, matched);
-          if !*matched { return };
-          try_deconstruct(env, root_def, &rest[1], snd, items, openers, matched);
-        },
-        _ => {
-          *matched = false;
-        }
+  fn put(&mut self, bix: SubstIndex, pat: ThinPExpr) {
+    let ix = bix.get_index();
+    let len = self.items.len();
+    if ix >= len {
+      for _ in 0 .. (ix - len) + 1 {
+        self.items.push(None);
       }
-    },
-    (ThinPExpr::Pt, a) => {
-      match a {
-        ScopedTermRepr::Pt => (),
-        _ => {
-          *matched = false;
-        }
-      }
-    },
-    (ThinPExpr::Group(atom, val), ScopedTermRepr::Inl(v)) => {
-      match atom {
-        Atom::Inl => {
-          try_deconstruct(env, root_def, &val[0], v, items, openers, matched);
-        },
-        _ => {
-          *matched = false;
-        }
-      }
-    },
-    (ThinPExpr::Group(atom, val), ScopedTermRepr::Inr(v)) => {
-      match atom {
-        Atom::Inr => {
-          try_deconstruct(env, root_def, &val[0], v, items, openers, matched);
-        },
-        _ => {
-          *matched = false;
-        }
-      }
-    },
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Lambda(_)) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Star) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Null) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::USort) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::Pt) |
-    (ThinPExpr::Group(_, _), ScopedTermRepr::LambdaHead(_, _)) => {
-      *matched = false;
-    },
+    }
+    self.items[ix] = Some(pat);
+  }
+  fn get(&self, bix: SubstIndex) -> &ThinPExpr {
+    self.items.get(bix.get_index()).unwrap().as_ref().unwrap()
   }
 }
 
-fn check_pi_tip(
+#[must_use]
+async fn check(
   env: &ElabEnv,
-  root_def: &CheckableDecl,
-  opener: &mut OpenerTerm,
-  head: &ScopedTerm,
-  pattern: &ThinPExpr,
-) {
-  match head.get_repr() {
-    ScopedTermRepr::Sigma { binder, head, tail } => todo!(),
-    ScopedTermRepr::Pi { binder, head, tail } => todo!(),
-    ScopedTermRepr::Either(l, r) => {
-      match pattern {
-        ThinPExpr::Discard => (),
-        ThinPExpr::Binder(_) => (),
-        ThinPExpr::Group(atom, rest) => {
-          match atom {
-            Atom::Inl => {
-              let mut local_opener = OpenerTerm::Unrefined;
-              check_pi_tip(env, root_def, &mut local_opener, l, &rest[0]);
-              *opener = OpenerTerm::Inl(Box::new(local_opener));
-            },
-            Atom::Inr => {
-              let mut local_opener = OpenerTerm::Unrefined;
-              check_pi_tip(env, root_def, &mut local_opener, r, &rest[0]);
-              *opener = OpenerTerm::Inr(Box::new(local_opener));
-            },
-            _ => {
-              root_def.inner().issues.push(ElabIssue::InvalidBinder);
-              return;
-            }
-          }
-        },
-        ThinPExpr::Pt => {
-          root_def.inner().issues.push(ElabIssue::InvalidBinder);
-          return;
-        },
-      }
-    },
-    ScopedTermRepr::Pair(l, r) => {
-      match pattern {
-        ThinPExpr::Discard => (),
-        ThinPExpr::Binder(_) => (),
-        ThinPExpr::Group(atom, rest) => {
-          match atom {
-            Atom::TupleCtor => {
-              let mut local_opener_l = OpenerTerm::Unrefined;
-              check_pi_tip(env, root_def, &mut local_opener_l, l, &rest[0]);
-              let mut local_opener_r = OpenerTerm::Unrefined;
-              check_pi_tip(env, root_def, &mut local_opener_r, r, &rest[1]);
-              *opener = OpenerTerm::Tuple(Box::new(local_opener_l), Box::new(local_opener_r));
-            }
-            _ => {
-              root_def.inner().issues.push(ElabIssue::InvalidBinder);
-              return;
-            }
-          }
-        },
-        ThinPExpr::Pt => {
-          root_def.inner().issues.push(ElabIssue::InvalidBinder);
-          return;
-        },
-      }
-    },
-    ScopedTermRepr::Arrow(_, _) => {
-      match pattern {
-        ThinPExpr::Discard => (),
-        ThinPExpr::Binder(_) => (),
-        _ => {
-          root_def.inner().issues.push(ElabIssue::InvalidBinder);
-          return;
-        }
-      }
-    },
-    ScopedTermRepr::Star => {
-      match pattern {
-        ThinPExpr::Discard => (),
-        ThinPExpr::Binder(_) => (),
-        _ => {
-          root_def.inner().issues.push(ElabIssue::InvalidBinder);
-          return;
-        }
-      }
-    },
-    ScopedTermRepr::Void => {
-      root_def.inner().issues.push(ElabIssue::InvalidBinder);
-      return;
-    },
-    ScopedTermRepr::Pt => {
-      match pattern {
-        ThinPExpr::Discard |
-        ThinPExpr::Binder(_) |
-        ThinPExpr::Pt => {
-          *opener = OpenerTerm::Pt;
-        },
-        _ => {
-          root_def.inner().issues.push(ElabIssue::InvalidBinder);
-          return;
-        }
-      }
-    },
-
+  def: &CheckableDecl,
+  ty: &ScopedTerm,
+  val: &ScopedTerm
+) -> Result<(), ElabIssue> {
+  match ty.get_repr() {
     ScopedTermRepr::App(_, _) => todo!(),
     ScopedTermRepr::GlobalRef(_) => todo!(),
     ScopedTermRepr::SubstRef(_) => todo!(),
-    ScopedTermRepr::LetGroup(_, _) => todo!(),
-
+    ScopedTermRepr::Sigma { binder, head, tail } => {
+      todo!()
+    },
+    ScopedTermRepr::Pi { .. } => {
+      if let ScopedTermRepr::Lambda(clauses) = val.get_repr() {
+        let mut octx = OpenerCtx::new();
+        for clause in clauses {
+          check_pi_lambda_clause(env, def, &mut octx, ty, clause).await?;
+        }
+        return Ok(());
+      } else {
+        return Err(ElabIssue::TypeMismatch {
+          rep: format!("{} :! {}", render_term(&val), render_term(&ty))
+        });
+      }
+    },
+    ScopedTermRepr::Either(_, _) => todo!(),
+    ScopedTermRepr::Pair(_, _) => todo!(),
+    ScopedTermRepr::Arrow(_, _) => todo!(),
     ScopedTermRepr::Tuple(_, _) => todo!(),
     ScopedTermRepr::Inl(_) => todo!(),
     ScopedTermRepr::Inr(_) => todo!(),
-    ScopedTermRepr::Lambda(_) => todo!(),
-    ScopedTermRepr::USort => unreachable!(),
-    ScopedTermRepr::Null => {
-      root_def.inner().issues.push(ElabIssue::InvalidBinder);
-      return;
-    },
+    ScopedTermRepr::LetGroup(_, _) => todo!(),
     ScopedTermRepr::LambdaHead(_, _) => todo!(),
+    ScopedTermRepr::Lambda(_) => todo!(),
+    ScopedTermRepr::Void => {
+      return Err(ElabIssue::TypeMismatch {
+        rep: format!("{} :! {}", render_term(&val) ,render_term(&ty))
+      });
+    },
+    ScopedTermRepr::Star => todo!(),
+    ScopedTermRepr::USort => {
+      match val.get_repr() {
+        ScopedTermRepr::App(_, _) => todo!(),
+        ScopedTermRepr::GlobalRef(_) => todo!(),
+        ScopedTermRepr::SubstRef(_) => todo!(),
+        ScopedTermRepr::Sigma { binder:_, head, tail } => todo!(),
+        ScopedTermRepr::Pi { binder, head, tail } => todo!(),
+        ScopedTermRepr::Either(_, _) => todo!(),
+        ScopedTermRepr::Pair(_, _) => todo!(),
+        ScopedTermRepr::Arrow(_, _) => todo!(),
+        ScopedTermRepr::Void => todo!(),
+        ScopedTermRepr::Pt => todo!(),
+        ScopedTermRepr::USort => unreachable!(),
+        _ => {
+          if let ScopedTermRepr::Star = ty.get_repr() {
+            return Err(ElabIssue::TypeMismatch {
+              rep: format!("{} :! {}", render_term(&val) ,render_term(&ty))
+            });
+          } else {
+            return Ok(());
+          }
+        },
+      }
+    },
+    ScopedTermRepr::Pt => {
+      if let ScopedTermRepr::Pt = val.get_repr() {
+        return Ok(());
+      } else {
+        return Err(ElabIssue::TypeMismatch {
+          rep: format!("{} :! {}", render_term(&val) ,render_term(&ty))
+        });
+      };
+    },
   }
 }
 
-#[test]
-fn build_env() {
+async fn eval(
+  env: &ElabEnv,
+  opener_context: &OpenerCtx,
+  val: &ScopedTerm
+) -> Result<(), ElabIssue> {
+  match val.get_repr() {
+    ScopedTermRepr::App(head, arg) => {
+      match head.get_repr() {
+        ScopedTermRepr::Lambda(cls) => todo!(),
+        _ => {
+          return Box::pin(eval(env, opener_context, head)).await;
+        }
+      }
+    },
+    ScopedTermRepr::GlobalRef(defid) => {
+      let smth = match get_def(env, *defid).await {
+        Ok(cdl) => cdl,
+        Err(_) => return Err(ElabIssue::BadDef),
+      };
+      val.assign_from(&smth.inner().scoped_decl.value);
+      return Ok(());
+    },
+    ScopedTermRepr::SubstRef(_) => {
+      return Ok(());
+    },
+    ScopedTermRepr::LetGroup(_, _) => todo!(),
+    _ => {
+      return Ok(());
+    }
+  }
+}
+
+async fn check_pi_lambda_clause(
+  env: &ElabEnv,
+  def: &CheckableDecl,
+  opener_context: &mut OpenerCtx,
+  ty: &ScopedTerm,
+  val: &ScopedTerm,
+) -> Result<(), ElabIssue> {
+  match ty.get_repr() {
+    ScopedTermRepr::Pi { binder, head, tail } => {
+      if let ScopedTermRepr::LambdaHead(b, rest) = val.get_repr() {
+        let head = head.deep_lazy_clone();
+        eval(env, opener_context, &head).await?;
+        Box::pin(check(env, def, &ScopedTerm::new_from_repr(ScopedTermRepr::USort), &head)).await?;
+        check_binder_aprop(env, opener_context, ty, &[b.clone()]).await?;
+        match binder {
+          ThinPExpr::Discard => (),
+          ThinPExpr::Binder(bix) => {
+            opener_context.put(*bix, b.clone());
+          },
+          _ => {
+            return Err(ElabIssue::UnsupportedBinder);
+          }
+        }
+        return Box::pin(check_pi_lambda_clause(env, def, opener_context, tail, rest)).await;
+      } else {
+        return Err(ElabIssue::TypeMismatch {
+          rep: format!("{} :! {}", render_term(&ty), render_term(&val))
+        });
+      }
+    },
+    ScopedTermRepr::LetGroup(_, _) => todo!(),
+    ScopedTermRepr::App(_, _) => todo!(),
+    ScopedTermRepr::GlobalRef(_) => todo!(),
+    ScopedTermRepr::SubstRef(_) => todo!(),
+    ScopedTermRepr::Sigma { binder, head, tail } => todo!(),
+    _ => {
+      return Err(ElabIssue::TypeMismatch {
+        rep: format!("{} :! {}", render_term(&ty), render_term(&val))
+      });
+    }
+  }
+}
+
+async fn check_binder_aprop(
+  env: &ElabEnv,
+  opener_context: &mut OpenerCtx,
+  ty: &ScopedTerm,
+  pats: &[ThinPExpr]
+) -> Result<(), ElabIssue> {
+  if pats.is_empty() { return Ok(()) }
+  match ty.get_repr() {
+    ScopedTermRepr::App(_, _) => {
+      return Err(ElabIssue::InvalidBinder);
+    },
+    ScopedTermRepr::GlobalRef(_) => {
+      return Err(ElabIssue::InvalidBinder);
+    },
+    ScopedTermRepr::SubstRef(_) => {
+      return Err(ElabIssue::InvalidBinder);
+    },
+    ScopedTermRepr::Sigma { binder, head, tail } => {
+      let head = head.deep_lazy_clone();
+      eval(env, opener_context, &head).await?;
+      match &pats[0] {
+        ThinPExpr::Discard => (),
+        ThinPExpr::Binder(_) => todo!(),
+        ThinPExpr::Group(Atom::TupleCtor, args) => {
+          Box::pin(check_binder_aprop(env, opener_context, &head, &[args[0].clone()])).await?;
+          match binder {
+            ThinPExpr::Discard => (),
+            ThinPExpr::Binder(bix) => {
+              opener_context.put(*bix, pats[0].clone());
+            },
+            _ => {
+              return Err(ElabIssue::UnsupportedBinder);
+            }
+          }
+          Box::pin(check_binder_aprop(env, opener_context, tail, &args[1..])).await?;
+        },
+        _ => {
+          return Err(ElabIssue::InvalidBinder);
+        }
+      }
+      return Ok(());
+    },
+    ScopedTermRepr::Pi { binder:_, head:_, tail:_ } => {
+      match &pats[0] {
+        ThinPExpr::Discard => {
+          return Ok(());
+        },
+        ThinPExpr::Binder(_) => {
+          return Ok(());
+        },
+        _ => {
+          return Err(ElabIssue::InvalidBinder);
+        }
+      }
+    },
+    ScopedTermRepr::Either(_, _) => todo!(),
+    ScopedTermRepr::Pair(_, _) => todo!(),
+    ScopedTermRepr::Arrow(_, _) => todo!(),
+    ScopedTermRepr::Tuple(_, _) => todo!(),
+    ScopedTermRepr::LetGroup(_, _) => todo!(),
+    ScopedTermRepr::Void => todo!(),
+    ScopedTermRepr::Pt => todo!(),
+
+    ScopedTermRepr::Inl(_) |
+    ScopedTermRepr::Inr(_) |
+    ScopedTermRepr::LambdaHead(_, _) |
+    ScopedTermRepr::Lambda(_) |
+    ScopedTermRepr::Star |
+    ScopedTermRepr::USort => {
+      unreachable!();
+    },
+  }
+}
+
+#[test] #[ignore]
+fn t0() {
   let mut text =
-    "a : (m: () or ()) -> { inl () => Void, inr () => () } m = { inl () => !, inr () => () }".to_string() +
+    "a : (m: () or ()) -> { inl () => (), inr () => () } m = { inl () => (), inr () => () }".to_string() +
     ""
   ;
   pad_string(&mut text);
@@ -727,8 +528,56 @@ fn build_env() {
     Err(err) => panic!("{:?}", err),
   };
   let elab_env = ElabEnv::new_from_scoped_defs(scoped);
-  elab(&elab_env);
+  let mut postponed = VecDeque::new();
+  begin_elab(&elab_env, &mut postponed);
+  println!("{:#?}", elab_env);
+}
+
+#[test] #[ignore]
+fn t1() {
+  let mut text =
+    "a : (T:*) -> T -> T = { _, i => i }".to_string() +
+    ""
+  ;
+  pad_string(&mut text);
+  let mut parser = SourceTextParser::new(text.as_bytes());
+  let raw_decls = match parser.parse_to_end() {
+    Ok(raw_decls) => raw_decls,
+    Err(err) => panic!("{:?}", err),
+  };
+  let mut scoped_checker = ScopeCheckCtx::new(text.as_bytes());
+  let scoped = match scope_check_decls(&mut scoped_checker, &raw_decls) {
+    Ok(scoped) => scoped,
+    Err(err) => panic!("{:?}", err),
+  };
+  let elab_env = ElabEnv::new_from_scoped_defs(scoped);
+  let mut postponed = VecDeque::new();
+  begin_elab(&elab_env, &mut postponed);
+  run_elab(&elab_env, &mut postponed);
   println!("{:#?}", elab_env);
 
 }
 
+#[test] #[ignore]
+fn t2() {
+  let mut text =
+    "a : (T:*) -> (d : (K:*) and ({ i, _ => i } T K)) -> { _ => () } d = { _, i => i }".to_string() +
+    ""
+  ;
+  pad_string(&mut text);
+  let mut parser = SourceTextParser::new(text.as_bytes());
+  let raw_decls = match parser.parse_to_end() {
+    Ok(raw_decls) => raw_decls,
+    Err(err) => panic!("{:?}", err),
+  };
+  let mut scoped_checker = ScopeCheckCtx::new(text.as_bytes());
+  let scoped = match scope_check_decls(&mut scoped_checker, &raw_decls) {
+    Ok(scoped) => scoped,
+    Err(err) => panic!("{:?}", err),
+  };
+  let elab_env = ElabEnv::new_from_scoped_defs(scoped);
+  let mut postponed = VecDeque::new();
+  begin_elab(&elab_env, &mut postponed);
+  println!("{:#?}", elab_env);
+
+}
