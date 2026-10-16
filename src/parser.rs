@@ -84,8 +84,7 @@ pub enum SExpr {
     Sigma { param: String, #[allow(dead_code)] param_span: Span, dom: Box<SExpr>, cod: Box<SExpr>, span: Span },
     /// Non-dependent pair type `A and B` (`and` binds tighter than `->`).
     And { dom: Box<SExpr>, cod: Box<SExpr>, span: Span },
-    /// Binary tuple `(a, b)`: pair value, or Sigma type in type position
-    /// (resolved during checking, not parsing).
+    /// Binary tuple `(a, b)`: pair value only (use `and` for product types).
     Tuple { first: Box<SExpr>, second: Box<SExpr>, span: Span },
     /// First / second projection (`fst` takes one `simple`, so `fst f x`
     /// parses as `(fst f) x`).

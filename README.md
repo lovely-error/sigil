@@ -33,11 +33,11 @@ allocators) and an unchecked SIMD lexer. This rewrite is **100% safe Rust**
   Data-level rewriting works because data lives in `*` too.
 - **`Void : *` with `absurd : (A:Type(?a)) -> Void -> A`** (primitive,
   stuck-neutral, level-polymorphic). Explosion into any level.
-- **Predicative Sigma**: `(x : A) and B`, `A and B`, `(a, b)` (same product
-  in type position), `fst`/`snd` with iota, plus dependent eliminator
+- **Predicative Sigma**: `(x : A) and B`, `A and B`, `(a, b)` values only,
+  `fst`/`snd` with iota, plus dependent eliminator
   `sig_rect A B P f p` (primitive, motives at any level, iota on complete
   redexes — `fst`/`snd` are definable from it). Formation takes the *max* of
-  its parts, so `(Void, *)` fits `Type0`, never `*`. No pair-eta (deferred).
+  its parts, so `Void and *` fits `Type0`, never `*`. No pair-eta (deferred).
 - **Predicative sums**: `A or B` with `inl`/`inr` (check-only against a known
   sum) and dependent eliminator `either_rect A B P f g e` (motives at any
   level, iota on both sides), plus dependent `match` with refinement

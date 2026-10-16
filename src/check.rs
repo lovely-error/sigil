@@ -56,7 +56,8 @@
 //! `(x : A) and B` / `A and B` live at the LARGER of their parts (`max`,
 //! computed when concrete, fresh-bounded variable otherwise). A small Sigma
 //! never smuggles a large component, so projecting can never manufacture
-//! largeness. Concretely: `(Void, *)` fits `Type0`, never `*` (pinned below).
+//! largeness. Concretely: `Void and *` fits `Type0`, never `*` (pinned below).
+//! `(a, b)` is values only (never a type spelling).
 //!
 //! ## `sig_rect` (dependent eliminator — implemented, same cautious footing)
 //! `sig_rect A B P f (a, b) : P (a, b)` with iota `sig_rect A B P f (a, b) ≡ f a b`
@@ -354,9 +355,8 @@ fn scope_expr(s: &mut Scope<'_>, e: &SExpr) -> Result<Core, CheckError> {
             })
         }
         SExpr::Tuple { first, second, .. } => {
-            // Always `Core::Pair`; pair-value vs Sigma-type meaning is
-            // resolved by checking mode downstream (see `check`, `infer`,
-            // `infer_sort_value`).
+            // Always `Core::Pair` (pair values only — never a type spelling;
+            // use `and` for product types).
             Ok(Core::Pair(
                 Box::new(scope_expr(s, first)?),
                 Box::new(scope_expr(s, second)?),
@@ -1208,7 +1208,7 @@ impl Checker {
     /// (annotated against the annotation, unannotated inferred) and
     /// ascriptions verified — evaluation alone would accept false ones, since
     /// it never checks what it unfolds. Canonical constructors (`Pi`,
-    /// `Sigma`, `Either`, `Quotient`, `Pair`, `Fst`, `Snd`) recurse
+    /// `Sigma`, `Either`, `Quotient`, `Fst`, `Snd`) recurse
     /// structurally (binders extend the context like lambda checking);
     /// everything else evaluates directly (neutrals re-infer through
     /// `is_type_value` at the caller, so their insides are checked there;
@@ -1244,7 +1244,7 @@ impl Checker {
                 self.check_ty(cod, &ctx2)?;
                 eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from)
             }
-            Core::Either(a, b) | Core::Pair(a, b) | Core::Quotient(a, b) => {
+            Core::Either(a, b) | Core::Quotient(a, b) => {
                 self.check_ty(a, ctx)?;
                 self.check_ty(b, ctx)?;
                 eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from)
@@ -1302,13 +1302,6 @@ impl Checker {
                 let j = self.infer_sort_value(&cod_v, &ctx2)?;
                 Ok(self.predicative_max(&i, &j))
             }
-            Value::Pair(a, b) => {
-                // `(a, b)` as a TYPE (non-dependent: `Pair` binds nothing).
-                // Same predicative rule: the larger side wins.
-                let i = self.infer_sort_value(&a, ctx)?;
-                let j = self.infer_sort_value(&b, ctx)?;
-                Ok(self.predicative_max(&i, &j))
-            }
             Value::Either(a, b) => {
                 // Predicative, like Sigma: the larger side wins. (An
                 // impredicative sum with case analysis projecting the content
@@ -1326,8 +1319,6 @@ impl Checker {
                 let j = self.quotient_cod_sort(&r, &a, ctx)?;
                 Ok(self.predicative_max(&i, &j))
             }
-            Value::Fst(pv) => self.infer_sort_project(true, &pv, ctx),
-            Value::Snd(pv) => self.infer_sort_project(false, &pv, ctx),
             Value::Var(_) | Value::Global(_, _) | Value::App(_, _)
             | Value::Match { .. } | Value::Meta { .. } => {
                 // Neutral type: quote back to core and infer; its type must
@@ -1352,10 +1343,12 @@ impl Checker {
                 "term {} is a function, not a type",
                 pretty_value(v, ctx.len(), &self.gvals, &self.gnames),
             ))),
-            // Introductions are terms, never types (`inl`/`inr`/`()`/`quot_mk`
-            // values can only appear in type positions via unfolding, which
-            // `whnf` handles before this match — reaching here means stuck).
-            Value::Inl(_) | Value::Inr(_) | Value::Pt | Value::QuotMk(_) => Err(CheckError::new(format!(
+            // Introductions and projections are terms, never types (`inl`/`inr`/
+            // `()`/`quot_mk`/`(a, b)`/`fst`/`snd` values can only appear in
+            // type positions via unfolding, which `whnf` handles before this
+            // match — reaching here means stuck; use `and` for product types).
+            Value::Inl(_) | Value::Inr(_) | Value::Pt | Value::QuotMk(_)
+            | Value::Pair(_, _) | Value::Fst(_) | Value::Snd(_) => Err(CheckError::new(format!(
                 "term {} is a value, not a type",
                 pretty_value(v, ctx.len(), &self.gvals, &self.gnames),
             ))),
@@ -1372,25 +1365,6 @@ impl Checker {
             return Ok(s);
         }
         self.infer_sort_value(v, ctx)
-    }
-
-    /// Sort of `fst p` / `snd p` used AS A TYPE: `p` must denote a pair *of
-    /// types* (iota first, so let-bound/global pair-types unfold). Anything
-    /// else — notably a Sigma-typed *term* — is rejected: projecting a term
-    /// is term-level business (see `infer_fst`), and a stuck non-pair has no
-    /// projection to give.
-    fn infer_sort_project(&self, is_fst: bool, pv: &Value, ctx: &Ctx) -> Result<Sort, CheckError> {
-        let mut fuel = FUEL_LIMIT;
-        match whnf(pv, &self.gvals, &mut fuel)? {
-            Value::Pair(a, b) => {
-                self.infer_sort_value(if is_fst { &a } else { &b }, ctx)
-            }
-            other => Err(CheckError::new(format!(
-                "cannot project `{}` of {} as a type (scrutinee is not a pair of types)",
-                if is_fst { "fst" } else { "snd" },
-                pretty_value(&other, ctx.len(), &self.gvals, &self.gnames),
-            ))),
-        }
     }
 
     // -- universe levels ----------------------------------------------------
@@ -1432,7 +1406,7 @@ impl Checker {
         }
     }
 
-    /// Predicative maximum of two sorts (Sigma/Pair/Either formation): both
+    /// Predicative maximum of two sorts (Sigma/Either formation): both
     /// small stays small; `*` is the identity (no constraint); concrete
     /// levels compute directly; anything else mints a fresh variable bounded
     /// below by both sides. (No symbolic `max` nodes anywhere.)
@@ -1649,8 +1623,8 @@ impl Checker {
                 Ok(Value::Sort(s))
             }
             Core::Pair(_, _) => Err(CheckError::new(format!(
-                "cannot infer type of {}: `(a, b)` is a pair value against \
-                 Sigma types and a Sigma type against sorts — annotate it \
+                "cannot infer type of {}: `(a, b)` is a pair value only \
+                 (use `and` for product types) — annotate it \
                  (e.g. `((a, b) : S)` or `let X : S = (a, b) in ...`)",
                 pretty_core(term, &self.gnames),
             ))),
@@ -1864,16 +1838,12 @@ impl Checker {
     /// Type of `fst p`: the Sigma's domain. Two cases:
     /// (i) `p` is syntactically a pair (avoids the ambiguity error);
     /// (ii) `p`'s type unfolds to a Sigma (ordinary term-level).
-    /// Deliberately NO case for sort-typed `p` (i.e. `p` is a *type* that
-    /// evaluates to a pair): projecting it here would return a type usable
-    /// as a term — unsound. Type-level projection lives in `infer_sort_value`
-    /// instead, which never flows into term positions.
+    /// Deliberately NO case for sort-typed `p`: pairs are values only, so
+    /// projecting a type is always an error.
     fn infer_fst(&self, p: &Core, ctx: &Ctx) -> Result<Value, CheckError> {
         if let Core::Pair(a, _) = p {
             // `fst (a, b)` has the type of `a` (pairs bind nothing, so no
-            // substitution is needed). (If `(a, b)` was meant as a type,
-            // this fails downstream via conversion — correctly, since a type
-            // is not a term.)
+            // substitution is needed).
             return self.infer(a, ctx);
         }
         let pty = self.infer(p, ctx)?;
@@ -2146,19 +2116,6 @@ impl Checker {
             | (Value::Snd(a1), Value::Snd(a2))
             | (Value::QuotMk(a1), Value::QuotMk(a2)) => {
                 self.seq_unify(&[(a1.as_ref(), a2.as_ref())], ctx, level)
-            }
-            // `(Sigma, Pair)` cross-spellings, mirroring `conv`.
-            (Value::Sigma { dom, cod, .. }, Value::Pair(a, b)) => {
-                self.seq_unify(&[(dom.as_ref(), a.as_ref())], ctx, level)?;
-                let fresh = Value::Var(level);
-                let v = cod.apply(fresh, &self.gvals)?;
-                self.seq_unify(&[(&v, b.as_ref())], ctx, level + 1)
-            }
-            (Value::Pair(a, b), Value::Sigma { dom, cod, .. }) => {
-                self.seq_unify(&[(a.as_ref(), dom.as_ref())], ctx, level)?;
-                let fresh = Value::Var(level);
-                let v = cod.apply(fresh, &self.gvals)?;
-                self.seq_unify(&[(b.as_ref(), &v)], ctx, level + 1)
             }
             // Sorts, variables, globals: meta-free here by construction
             // (the pre-scan routed anything meta-bearing above), so `conv`
@@ -2720,9 +2677,7 @@ impl Checker {
                 }
             }
         }
-        // Pairs against Sigma/Pair/sorts (never merely unfolded: like Lam,
-        // a pair's meaning depends on the expected type — value against
-        // Sigma/Pair, formation against sorts).
+        // Pairs against Sigma only (values only — use `and` for types).
         if let Core::Pair(a, b) = val {
             return self.check_pair(a, b, expected, ctx);
         }
@@ -2913,10 +2868,10 @@ impl Checker {
         }
     }
 
-    /// Check a pair `(a, b)` against an expected type: components against a
-    /// Sigma (second sees first via the binder), uniformly against a Pair,
-    /// formation against a sort. Anything else falls back to inference,
-    /// which rejects `(a, b)` as ambiguous.
+    /// Check a pair `(a, b)` against an expected Sigma type (components
+    /// against dom/cod, second sees first via the binder). Anything else
+    /// falls back to inference, which rejects `(a, b)` as ambiguous
+    /// (values only — use `and` for product types).
     fn check_pair(
         &self,
         a: &Core,
@@ -2934,36 +2889,14 @@ impl Checker {
                 let tail = cod.apply(av, &self.gvals)?;
                 self.check(b, &tail, ctx)
             }
-            Value::Pair(x, y) => {
-                let (x, y) = (x.clone(), y.clone());
-                self.check(a, &x, ctx)?;
-                self.check(b, &y, ctx)
-            }
-            Value::Sort(s) => {
-                // `(a, b)` as a TYPE: validate predicative formation and fit
-                // by cumulativity.
-                let actual = self.infer_sort(
-                    &Core::Pair(Box::new(a.clone()), Box::new(b.clone())),
-                    ctx,
-                )?;
-                self.require_sort_le(&actual, s).map_err(|_| {
-                    CheckError::new(format!(
-                        "({}, {}) : {}, but expected a type in {} (large type in small universe)",
-                        pretty_core(a, &self.gnames),
-                        pretty_core(b, &self.gnames),
-                        actual,
-                        s,
-                    ))
-                })
-            }
             _ => {
-                // Anything else: pairs only elaborate with guidance. Surface
+                // Anything else: pairs only elaborate against Sigma. Surface
                 // the ambiguity error from inference (it always errors).
                 let pair = Core::Pair(Box::new(a.clone()), Box::new(b.clone()));
                 match self.infer(&pair, ctx) {
                     Err(e) => Err(e),
                     Ok(_) => Err(CheckError::new(format!(
-                        "({}, {}) :! {} (pair fits Sigma/Pair/sorts only)",
+                        "({}, {}) :! {} (pair fits Sigma only)",
                         pretty_core(a, &self.gnames),
                         pretty_core(b, &self.gnames),
                         pretty_value(&exp, ctx.len(), &self.gvals, &self.gnames),
@@ -3833,11 +3766,11 @@ mod tests {
         // Small parts: small Sigma. (`Void` is the only closed small type.)
         ok("def s : * = (x : Void) and Void;");
         ok("def s : * = Void and Void;");
-        // The `(A, B)` spelling means the same product in type position.
-        ok("def s : * = (Void, Void);");
+        // `(a, b)` is values only — never a type spelling.
+        fails("def s : * = (Void, Void);");
         // Any `Type0` part forces `Type0` — impredicative-Sigma would claim `*`.
-        fails("def bad : * = (Void, *);");
-        ok("def good : Type0 = (Void, *);");
+        fails("def bad : * = Void and *;");
+        ok("def good : Type0 = Void and *;");
         fails("def bad : * = (u:*) -> ((A : * -> *) and A u);");
         ok("def good : Type0 = (u:*) -> ((A : * -> *) and A u);");
     }
@@ -4707,7 +4640,9 @@ mod tests {
         // `fst` of a non-pair (neutral whose type is not Sigma).
         fails("def bad : (A:*) -> A = \\A. fst A;");
         fails("def bad : * = fst *;");
-        // Bare `(a, b)` in inference position is ambiguous (type or value?).
+        // Bare `(a, b)` never forms a type (values only — use `and`).
+        fails("def bad : * = (Void, Void);");
+        // Bare `(a, b)` in inference position is ambiguous (needs Sigma).
         fails("def b : * = (let X = (Void, Void) in X);");
         // Lambdas as components need annotations (bidirectional limit).
         fails("def t : (v:Void) -> Void = \\v. fst ((\\w. w), (absurd Void v)) (absurd Void v);");

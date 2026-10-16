@@ -1,9 +1,9 @@
 -- Dependent pairs, predicatively: a Sigma lives with the LARGER of its parts.
--- `(a, b)` means the same product in type position (resolved by mode, not
--- parsing). Projections compute by iota, definitionally.
+-- `(a, b)` is values only (use `and` for product types). Projections
+-- compute by iota, definitionally.
 
 -- Small Sigmas (all parts small).
-def vpair : * = (Void, Void);
+def vpair : * = Void and Void;
 def dpair : * = (x : Void) and Void;
 
 -- Introduction and projections.
@@ -12,7 +12,7 @@ def get1 : (p:(x:Void) and Void) -> Void = \p. fst p;
 def get2 : (A:*) -> (B:A -> *) -> (p:(x:A) and B x) -> B (fst p) = \A B p. snd p;
 
 -- Large pairs live in `Type0` (any `Type0` part forces `Type0`) ...
-def big : Type = (Void, *);
+def big : Type = Void and *;
 -- ... but their *components* can still be small types on either side.
 def bigdep : (v:Void) -> ((x:Void) and *) = \v. (absurd Void v, Void -> Void);
 

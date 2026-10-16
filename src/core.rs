@@ -87,8 +87,8 @@ pub enum Core {
     /// Dependent pair type `(x : A) and B` (cod under binder). Non-dependent
     /// `A and B` uses `"_"`. Formation is PREDICATIVE (see `check.rs`).
     Sigma { name: String, dom: Box<Core>, cod: Box<Core> },
-    /// Pair `(a, b)`. Meaning resolved by checking mode: pair value against
-    /// Sigma types, Sigma formation against sorts (see `check.rs`).
+    /// Pair value `(a, b)` (checked against Sigma types only; unlike
+    /// `and`, it never forms a type — see `check.rs`).
     Pair(Box<Core>, Box<Core>),
     /// Projections (term formers, so their types come from the scrutinee).
     Fst(Box<Core>),
@@ -1160,25 +1160,6 @@ pub fn conv(
         (Value::QuotLift, Value::QuotLift) => Ok(true),
         (Value::QuotInd, Value::QuotInd) => Ok(true),
         (Value::QuotSound, Value::QuotSound) => Ok(true),
-        // `(A, B)`-as-type and `A and B` are the same product across
-        // spellings: compare domain against first, codomain against second.
-        // (Against ill-formed sides this simply fails — sound either way.)
-        (Value::Sigma { dom, cod, .. }, Value::Pair(a, b)) => {
-            if !conv(level, &dom, &a, globals, fuel, depth + 1, ucs)? {
-                return Ok(false);
-            }
-            let fresh = Value::Var(level);
-            let v = cod.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
-            conv(level + 1, &v, &b, globals, fuel, depth + 1, ucs)
-        }
-        (Value::Pair(a, b), Value::Sigma { dom, cod, .. }) => {
-            if !conv(level, &a, &dom, globals, fuel, depth + 1, ucs)? {
-                return Ok(false);
-            }
-            let fresh = Value::Var(level);
-            let v = cod.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
-            conv(level + 1, &b, &v, globals, fuel, depth + 1, ucs)
-        }
         (Value::Fst(p1), Value::Fst(p2)) => {
             conv(level, &p1, &p2, globals, fuel, depth + 1, ucs)
         }
@@ -2159,7 +2140,7 @@ mod tests {
 
     #[test]
     fn sigma_pair_duality() {
-        // `A and B` converts with `(A, B)` across spellings.
+        // `(a, b)` is values only: `A and B` does NOT convert with it.
         let globals = GlobalVals::new();
         let mut fuel = FUEL_LIMIT;
         let empty: Env = Vec::new();
@@ -2171,6 +2152,6 @@ mod tests {
         let pair = Core::Pair(Box::new(Core::Sort(Sort::Star)), Box::new(Core::Sort(Sort::Star)));
         let sv = eval(&sigma, &empty, &globals).unwrap();
         let pv = eval(&pair, &empty, &globals).unwrap();
-        assert!(conv(0, &sv, &pv, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(!conv(0, &sv, &pv, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
     }
 }
