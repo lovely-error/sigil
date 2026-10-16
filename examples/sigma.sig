@@ -23,3 +23,6 @@ def appfst : (f:Void -> Void) -> (v:Void) -> Void = \f v. fst (f, (absurd Void v
 -- from `sig_rect` (all args explicit, `*`-motives).
 def fst2 : (A:*) -> (B:A -> *) -> (p:(x:A) and B x) -> A = \A B p. sig_rect A B (\_. A) (\a b. a) p;
 def snd2 : (A:*) -> (B:A -> *) -> (p:(x:A) and B x) -> B (fst p) = \A B p. sig_rect A B (\p. B (fst p)) (\a b. b) p;
+
+-- Eta: every `p` is `(fst p, snd p)` definitionally (no axiom).
+def eta : (A:*) -> (B:A -> *) -> (p:(x:A) and B x) -> (P:(((x:A) and B x) -> *)) -> P p -> P (fst p, snd p) = \A B p P x. x;

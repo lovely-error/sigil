@@ -67,7 +67,8 @@
 //! by construction (the reduct `f a b` is checked against `P (a, b)` at the
 //! minor premise), spends fuel like beta, and fires via spine analysis in
 //! `do_apply` (so global-aliased eliminators count) plus `whnf` routing (so
-//! redexes completed by unfolding still reduce). Pair-eta stays deferred.
+//! redexes completed by unfolding still reduce). Pair-eta holds definitionally
+//! (`p ≡ (fst p, snd p)` in `conv`, like function and Unit eta).
 //!
 //! ## `either_rect` (sums — same cautious footing as Sigma)
 //! `A or B` forms predicatively (`max`); `inl`/`inr` check against known
@@ -4273,6 +4274,15 @@ mod tests {
             def wzero : WNat = sup (Unit or Unit) Bf (inl () : Unit or Unit) (\\x. absurd WNat x); \
             def wsucc : WNat -> WNat = \\n. sup (Unit or Unit) Bf (inr () : Unit or Unit) (\\_. n); \
             def inrCase : (P:(WNat -> *)) -> (st:(n:WNat) -> P n -> P (wsucc n)) -> (f:(Unit -> WNat)) -> (ih:(u:Unit) -> P (f u)) -> P (sup (Unit or Unit) Bf (inr () : Unit or Unit) f) = \\P st f ih. st (f ()) (ih ());");
+    }
+
+    #[test]
+    fn sigma_eta_holds() {
+        // Definitional `p ≡ (fst p, snd p)` (conversion-level Sigma-eta,
+        // no axiom): transport along it checks by `\\x. x`.
+        ok("def peta : (A:*) -> (B:A -> *) -> (p:(x:A) and B x) -> (P:(((x:A) and B x) -> *)) -> P p -> P (fst p, snd p) = \\A B p P x. x;");
+        // Eta does not over-identify: distinct neutrals stay unequal.
+        fails("def bad : (A:*) -> (p:(x:A) and A) -> (q:(x:A) and A) -> (P:(((x:A) and A) -> *)) -> P p -> P q = \\A p q P x. x;");
     }
 
     #[test]

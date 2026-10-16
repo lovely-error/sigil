@@ -1050,7 +1050,8 @@ fn conv_sort_eq(x: Sort, y: Sort, ucs: &mut Vec<Constraint>) -> bool {
         _ => false,
     }
 }
-/// Definitional equality with beta/delta and eta-for-functions. Sorts compare
+/// Definitional equality with beta/delta and eta for functions, pairs, and
+/// Unit. Sorts compare
 /// by *universe equality*: identical sorts hold; distinct concrete levels
 /// fail; anything involving a level variable records both-direction `<=`
 /// constraints (equality — sound wherever conversion runs) and holds.
@@ -1135,6 +1136,51 @@ pub fn conv(
                 return Ok(false);
             }
             conv(level, &b1, &b2, globals, fuel, depth + 1, ucs)
+        }
+        // Sigma eta (definitional `p ≡ (fst p, snd p)`, like function eta and
+        // Unit eta): a pair converts with a neutral iff the components convert
+        // with the projections (iota fires on the pair side through `whnf`).
+        // Only neutrals expand — canonicals of other types stay unequal.
+        // Like the etas above, this is sound for well-typed inputs (`conv`
+        // never learns types, so ill-typed comparisons can over-identify;
+        // the checker only converts elaborated, well-typed terms).
+        (Value::Pair(a, b), other)
+            if matches!(
+                other,
+                Value::Var(_)
+                    | Value::Global(_, _)
+                    | Value::App(_, _)
+                    | Value::Match { .. }
+                    | Value::Fst(_)
+                    | Value::Snd(_)
+                    | Value::Meta { .. }
+            ) =>
+        {
+            let fa = Value::Fst(Box::new(other.clone()));
+            if !conv(level, &a, &fa, globals, fuel, depth + 1, ucs)? {
+                return Ok(false);
+            }
+            let fb = Value::Snd(Box::new(other));
+            conv(level, &b, &fb, globals, fuel, depth + 1, ucs)
+        }
+        (other, Value::Pair(a, b))
+            if matches!(
+                other,
+                Value::Var(_)
+                    | Value::Global(_, _)
+                    | Value::App(_, _)
+                    | Value::Match { .. }
+                    | Value::Fst(_)
+                    | Value::Snd(_)
+                    | Value::Meta { .. }
+            ) =>
+        {
+            let fa = Value::Fst(Box::new(other.clone()));
+            if !conv(level, &fa, &a, globals, fuel, depth + 1, ucs)? {
+                return Ok(false);
+            }
+            let fb = Value::Snd(Box::new(other));
+            conv(level, &fb, &b, globals, fuel, depth + 1, ucs)
         }
         (Value::Either(a1, b1), Value::Either(a2, b2)) => {
             if !conv(level, &a1, &a2, globals, fuel, depth + 1, ucs)? {
@@ -2153,5 +2199,30 @@ mod tests {
         let sv = eval(&sigma, &empty, &globals).unwrap();
         let pv = eval(&pair, &empty, &globals).unwrap();
         assert!(!conv(0, &sv, &pv, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+    }
+
+    #[test]
+    fn sigma_eta() {
+        // `p ≡ (fst p, snd p)`: a neutral converts with its expansion, and
+        // a pair converts with a neutral iff the components do.
+        let globals = GlobalVals::new();
+        let mut fuel = FUEL_LIMIT;
+        let p = Value::Var(0);
+        let eta = Value::Pair(
+            Box::new(Value::Fst(Box::new(Value::Var(0)))),
+            Box::new(Value::Snd(Box::new(Value::Var(0)))),
+        );
+        assert!(conv(0, &p, &eta, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        // Control: different neutrals stay unequal through eta.
+        let mut fuel = FUEL_LIMIT;
+        let q = Value::Pair(
+            Box::new(Value::Fst(Box::new(Value::Var(1)))),
+            Box::new(Value::Snd(Box::new(Value::Var(1)))),
+        );
+        assert!(!conv(0, &p, &q, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        // Canonicals of other types never expand.
+        let mut fuel = FUEL_LIMIT;
+        let inl = Value::Inl(Box::new(Value::Var(0)));
+        assert!(!conv(0, &eta, &inl, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
     }
 }

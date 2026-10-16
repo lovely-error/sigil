@@ -37,7 +37,8 @@ allocators) and an unchecked SIMD lexer. This rewrite is **100% safe Rust**
   `fst`/`snd` with iota, plus dependent eliminator
   `sig_rect A B P f p` (primitive, motives at any level, iota on complete
   redexes — `fst`/`snd` are definable from it). Formation takes the *max* of
-  its parts, so `Void and *` fits `Type0`, never `*`. No pair-eta (deferred).
+  its parts, so `Void and *` fits `Type0`, never `*`. Pair-eta holds
+  definitionally (`p ≡ (fst p, snd p)`).
 - **Predicative sums**: `A or B` with `inl`/`inr` (check-only against a known
   sum) and dependent eliminator `either_rect A B P f g e` (motives at any
   level, iota on both sides), plus dependent `match` with refinement
