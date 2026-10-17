@@ -35,9 +35,12 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          BIN=target/${{ matrix.target }}/release/sigil-neo
-          if [ ! -x "$BIN" ]; then BIN="$BIN.exe"; fi
-          tar czf sigil-neo-${{ matrix.target }}.tar.gz "$(basename "$BIN")"
+          cd target/${{ matrix.target }}/release
+          if [ -f sigil-neo.exe ]; then
+            tar czf ../../../sigil-neo-${{ matrix.target }}.tar.gz sigil-neo.exe
+          else
+            tar czf ../../../sigil-neo-${{ matrix.target }}.tar.gz sigil-neo
+          fi
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
