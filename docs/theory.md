@@ -4,7 +4,8 @@
 predicative hierarchy `Type0 : Type1 : ...`. Total, bidirectional,
 cumulative upward, with NbE conversion. This file explains each choice and
 where it lives in code. For the rules themselves (formation, introduction,
-elimination, computation), see [`rules.md`](rules.md).
+elimination, computation), see [`rules.md`](rules.md); for what their
+soundness rests on, see [`soundness.md`](soundness.md).
 
 ## Sorts and axioms
 

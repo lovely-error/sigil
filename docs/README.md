@@ -12,6 +12,9 @@ Root `README.md` is the short overview. Start here for the full story:
   former: why each rule is shaped the way it is.
 - [`rules.md`](rules.md) — formation, introduction, elimination, and
   computation rules for every type former, with checked snippets.
+- [`soundness.md`](soundness.md) — the auditable soundness inventory:
+  trusted premises per rule, why each holds, code anchors, adversarial
+  gates, and the roadmap to mechanization.
 - [`examples.md`](examples.md) — guided tour of `examples/*.sig`: what each
   file proves and whether it should pass or fail.
 

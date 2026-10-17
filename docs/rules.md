@@ -345,11 +345,6 @@ quot_sound A R a b h             — no iota: stuck-neutral (no exactness)
   `quot_lift`'s respectfulness; `squashBeta` computes definitionally
   (`examples/quot.sig`).
 
-```sigil
-def Q01 : * = Quot (Unit or Unit) (\_ _. Unit or Unit);
-def clsL : Q01 = quot_mk (inl () : Unit or Unit);
-def bigQ : Type = Quot * (\_ _. *);               -- Type0 relation: large quotient
-```
 
 ## Leibniz `path` (derived, not primitive)
 
@@ -372,12 +367,6 @@ path_subst T v v (id_path T v) M h  ≡  h
 - ✗ a large-family lift (`P : T -> Type`) is rejected — conversion is
   equality, not lifting (`examples/fail_leib_lift.sig`).
 
-```sigil
-def path : (T:*) -> (a:T) -> (b:T) -> * =
-  \T a b. (P:(T -> *)) -> (P a) -> (P b);
-def path_subst : (T:*) -> (a:T) -> (b:T) -> (p:path T a b) -> (M:(T -> *)) -> (v:M a) -> M b =
-  \T a b p M v. p M v;
-```
 
 ## Derived data (no rules of their own)
 
