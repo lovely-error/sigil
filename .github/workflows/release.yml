@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test (sigma example must check)
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/sigil-neo
+          if [ ! -x "$BIN" ]; then BIN="$BIN.exe"; fi
+          "$BIN" check examples/sigma.sig
+      - name: Package
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/sigil-neo
+          if [ ! -x "$BIN" ]; then BIN="$BIN.exe"; fi
+          tar czf sigil-neo-${{ matrix.target }}.tar.gz "$(basename "$BIN")"
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sigil-neo-${{ matrix.target }}.tar.gz
