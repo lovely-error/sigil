@@ -165,8 +165,7 @@ Common shapes:
 Group motive domains. `(P:(A or B -> *))` parses as `A or (B -> *)`;
 write `(P:((A or B) -> *))`. Same for `and`:
 `(P:((x:A) and B x -> *))` misparses; write
-`(P:(((x:A) and B x) -> *))`. This is noted in root `README.md` and pinned
-by `examples/*.sig` usage.
+`(P:(((x:A) and B x) -> *))`. Pinned by `examples/*.sig` usage.
 
 Bare introductions never infer: `inl`, `inr`, `quot_mk` need a known type
 from annotation or the expected type. `(inl () : Unit or Unit)` works,
