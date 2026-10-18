@@ -28,9 +28,13 @@ use crate::subst::contains_meta;
 /// budget, and `nat_ind`/`funext`-scale chains (nested transports through
 /// delta-unfolded globals) legitimately need tens of thousands of steps —
 /// verified by `nat_ind_stuck_at_sound`, which exhausts 20k but settles
-/// well under 100k. Diverging terms still error, only slightly later
-/// (steps are microseconds; the depth cap, not fuel, guards the stack).
-pub const FUEL_LIMIT: u32 = 100_000;
+/// well under 100k. Raised to 400k after `examples/afsnat.sig`: AFS-style
+/// subtype certificates (`limSucc`-shaped Σ-pairs unfolding inside
+/// Leibniz-path types against abstract variables) peak just under 150k
+/// steps for one conversion, and chained derivations multiply that.
+/// Diverging terms still error, only slightly later (steps are
+/// microseconds; the depth cap, not fuel, guards the stack).
+pub const FUEL_LIMIT: u32 = 400_000;
 /// Nesting-depth cap for evaluation (threaded functionally: each nested call
 /// gets `depth - 1`, so no decrement discipline can leak). Bounds Rust-stack
 /// use no matter what the step budget allows: depth and work are capped
