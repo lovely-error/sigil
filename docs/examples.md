@@ -22,6 +22,7 @@ file documents one boundary and is pinned by a test in `src/check.rs` or
 | `nat.sig` | W-derived `WNat` (formation, `wzero`/`wsucc`, `nat_rec` computing, full `nat_ind`, `wplus` + commutativity) and Church `Nat` (`plus one one ≡ two`). |
 | `holes.sig` | `_ : Unit` is `()`, function eta, holes in pairs, `_` annotation inference, solving through application (`id_path _ ()`). |
 | `wmap.sig` | Weak maps, fibers, quotient splicing ported from Lean (transports, both quotient maps, roundtrip equation). Coherence proofs documented as future work in-file. |
+| `afsnat.sig` | AFS refinement `Nat := Σ(ν:NatStar) Lim(ν)` (arXiv:1802.02820 §4): subtype + `Lim′` certificates (`nlim`/`limZero`/`limSucc`/`limTwo`), `rec` as `pr₁`-application, definitional `beta_zero`/`beta_succ`, numeral computation, and the `etaMid` pointwise-η engine — all with no `uip`. |
 
 ## Should fail (boundaries)
 
@@ -50,6 +51,7 @@ Run the whole tour:
 ```sh
 cargo run -- check examples/prelude.sig  # 0
 cargo run -- check examples/nat.sig       # 0
+cargo run -- check examples/afsnat.sig    # 0
 cargo run -- check examples/fail_match.sig   # 1
 cargo run -- check examples/fail_levels.sig  # 1
 ```

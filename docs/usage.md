@@ -8,7 +8,7 @@ library. `#![forbid(unsafe_code)]`.
 ```sh
 cargo build              # debug binary at target/debug/sigil-neo
 cargo run -- --help      # print help (same as sigil-neo --help)
-cargo test               # 153 unit + end-to-end tests (examples/ via include_str!)
+cargo test               # 156 unit + end-to-end tests (examples/ via include_str!)
 cargo run -- check examples/prelude.sig   # exits 0 on success
 ```
 

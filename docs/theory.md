@@ -95,7 +95,7 @@ and large motive families from being equated inside conversion
 (`liftPath`-shaped ascriptions stay rejected) while `*`-motives still check
 against level-general primitives through subsumption.
 
-Evaluation is fuel-bounded (`FUEL_LIMIT = 100_000`) with nesting caps
+Evaluation is fuel-bounded (`FUEL_LIMIT = 400_000`) with nesting caps
 (`EVAL_DEPTH_LIMIT`, `DEPTH_LIMIT`). Divergence and hostile nesting become
 checked errors, never hangs or host overflows. `whnf` unfolds globals
 (backwards-only references, so unfolding is well-founded) and fires
@@ -182,7 +182,11 @@ split Bool family (formation, intro, `nat_rec` computing definitionally via
 `match`-refined `w_rect` steps, full `nat_ind` via derived funext +
 Unit-eta transports under a generalized motive), and computationally via
 Church numerals (`plus one one ≡ two` by beta alone; Geuvers: dependent
-induction not derivable there).
+induction not derivable there). A third, richer derivation is the AFS
+subtyping refinement (`examples/afsnat.sig`,
+`Nat := Σ(ν:NatStar) Lim(ν)` with `Lim′` certificates): formation, intro
+(`zero`/`succ` as certificate pairs), `rec` as `pr₁`-application,
+definitional β, and the `etaMid` pointwise-η engine — no `uip` needed.
 
 Leibniz `path T a b ≡ (P:(T -> *) -> P a -> P b)` lives in `*` and
 eliminates by application (`path_subst`). Funext
