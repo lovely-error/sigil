@@ -4263,6 +4263,21 @@ mod tests {
     }
 
     #[test]
+    fn afsnat_sig_checks_end_to_end() {
+        // AFS refinement Nat (subtype `Σ(ν:NatStar) Lim(ν)` + Lim′
+        // certificates, `rec` as `pr₁`-application, definitional β, and the
+        // `etaMid` pointwise-η engine): the uip-free AFS agenda, one file so
+        // it cannot drift from the core.
+        let src = include_str!("../examples/afsnat.sig");
+        let checker = check_program(src).expect("afsnat.sig must parse");
+        assert!(
+            !checker.has_errors(),
+            "afsnat.sig must check:\n{}",
+            checker.report()
+        );
+    }
+
+    #[test]
     fn unit_eta_holds() {
         // Definitional uniqueness of `()`: any `u : Unit` is convertible with
         // `()` (conversion-level Unit-eta, no axiom).
