@@ -97,7 +97,7 @@ and the pin.
   predicate families `P : T -> *`; `P : T -> Type` is deliberately not
   identified.
 - **Enforcement**: unlike the shape-only etas, this arm is type-directed
-  (`conv_typed` / `pmct_eta_normalize`, `src/core.rs`). Conversion is
+  (`conv` / `pmct_eta_normalize`, `src/core.rs`). Conversion is
   threaded with the context's variable types and each global's recorded
   type (`GlobalDef.ty`), and normalizes a neutral of that type to the
   identity before comparing, plus applications rooted at it to their

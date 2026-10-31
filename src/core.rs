@@ -1122,6 +1122,7 @@ fn value_type(
 fn is_pmct_eta_type(
     ty: &Value,
     level: usize,
+    var_types: &[Option<Value>],
     globals: &GlobalVals,
     fuel: &mut u32,
     depth: u32,
@@ -1172,9 +1173,9 @@ fn is_pmct_eta_type(
             return Ok(false);
         }
     }
-    let mut local_types = Vec::new();
+    let mut local_types = var_types.to_vec();
     let mut local_ucs = Vec::new();
-    let eq = conv_typed(
+    let eq = conv(
         level,
         &arg,
         &arg2,
@@ -1224,7 +1225,7 @@ fn pmct_eta_normalize(
         return Ok(v.clone());
     }
     if let Some(ty) = value_type(v, var_types, globals, fuel, depth + 1)? {
-        if is_pmct_eta_type(&ty, level, globals, fuel, depth + 1, ucs)? {
+        if is_pmct_eta_type(&ty, level, var_types, globals, fuel, depth + 1, ucs)? {
             return Ok(identity_value(2));
         }
     }
@@ -1238,7 +1239,7 @@ fn pmct_eta_normalize(
         return Ok(v.clone());
     }
     if let Some(ty) = value_type(head, var_types, globals, fuel, depth + 1)? {
-        if is_pmct_eta_type(&ty, level, globals, fuel, depth + 1, ucs)? {
+        if is_pmct_eta_type(&ty, level, var_types, globals, fuel, depth + 1, ucs)? {
             args.reverse();
             return Ok(match args.len() {
                 1 => identity_value(1),
@@ -1249,8 +1250,10 @@ fn pmct_eta_normalize(
     Ok(v.clone())
 }
 
-/// Definitional equality with beta/delta and eta for functions, pairs, and
-/// Unit. Sorts compare
+/// Type-directed definitional equality with beta/delta and eta for
+/// functions, pairs, Unit, and PMCT. Every caller supplies the ambient
+/// variable-type vector (`var_types`); there is no untyped entry point.
+/// Sorts compare
 /// by *universe equality*: identical sorts hold; distinct concrete levels
 /// fail; anything involving a level variable records both-direction `<=`
 /// constraints (equality — sound wherever conversion runs) and holds.
@@ -1258,21 +1261,7 @@ fn pmct_eta_normalize(
 /// `conv`.) `ucs` collects the recorded constraints; callers must roll them
 /// back if conversion ultimately fails (see `check.rs` checkpointing), since
 /// a failed comparison must leave no trace.
-#[allow(dead_code)]
 pub fn conv(
-    level: usize,
-    a: &Value,
-    b: &Value,
-    globals: &GlobalVals,
-    fuel: &mut u32,
-    depth: u32,
-    ucs: &mut Vec<Constraint>,
-) -> Result<bool, EvalError> {
-    let mut var_types = Vec::new();
-    conv_typed(level, a, b, &mut var_types, globals, fuel, depth, ucs, true)
-}
-
-pub fn conv_typed(
     level: usize,
     a: &Value,
     b: &Value,
@@ -1351,42 +1340,43 @@ pub fn conv_typed(
             Ok(true)
         }
         (Value::Pi { dom: d1, cod: c1, .. }, Value::Pi { dom: d2, cod: c2, .. }) => {
-            if !conv_typed(level, &d1, &d2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &d1, &d2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
             let fresh = Value::Var(level);
             let v1 = c1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
             let v2 = c2.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
             var_types.push(Some((*d1).clone()));
-            let r = conv_typed(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
+            let r = conv(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
             var_types.pop();
             r
         }
         (Value::Sigma { dom: d1, cod: c1, .. }, Value::Sigma { dom: d2, cod: c2, .. }) => {
-            if !conv_typed(level, &d1, &d2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &d1, &d2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
             let fresh = Value::Var(level);
             let v1 = c1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
             let v2 = c2.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
             var_types.push(Some((*d1).clone()));
-            let r = conv_typed(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
+            let r = conv(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
             var_types.pop();
             r
         }
         (Value::Pair(a1, b1), Value::Pair(a2, b2)) => {
-            if !conv_typed(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
-            conv_typed(level, &b1, &b2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &b1, &b2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         // Sigma eta (definitional `p ≡ (fst p, snd p)`, like function eta and
         // Unit eta): a pair converts with a neutral iff the components convert
         // with the projections (iota fires on the pair side through `whnf`).
         // Only neutrals expand — canonicals of other types stay unequal.
-        // Like the etas above, this is sound for well-typed inputs (`conv`
-        // never learns types, so ill-typed comparisons can over-identify;
-        // the checker only converts elaborated, well-typed terms).
+        // Like the etas above, this is sound for well-typed inputs (these
+        // shape arms do not consult types, so ill-typed comparisons can
+        // over-identify; the checker only converts elaborated, well-typed
+        // terms).
         (Value::Pair(a, b), other)
             if matches!(
                 other,
@@ -1400,11 +1390,11 @@ pub fn conv_typed(
             ) =>
         {
             let fa = Value::Fst(Box::new(other.clone()));
-            if !conv_typed(level, &a, &fa, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &a, &fa, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
             let fb = Value::Snd(Box::new(other));
-            conv_typed(level, &b, &fb, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &b, &fb, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (other, Value::Pair(a, b))
             if matches!(
@@ -1419,48 +1409,48 @@ pub fn conv_typed(
             ) =>
         {
             let fa = Value::Fst(Box::new(other.clone()));
-            if !conv_typed(level, &fa, &a, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &fa, &a, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
             let fb = Value::Snd(Box::new(other));
-            conv_typed(level, &fb, &b, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &fb, &b, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::Either(a1, b1), Value::Either(a2, b2)) => {
-            if !conv_typed(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
-            conv_typed(level, &b1, &b2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &b1, &b2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::Inl(a1), Value::Inl(a2)) => {
-            conv_typed(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::Inr(b1), Value::Inr(b2)) => {
-            conv_typed(level, &b1, &b2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &b1, &b2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::Quotient(a1, r1), Value::Quotient(a2, r2)) => {
-            if !conv_typed(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
-            conv_typed(level, &r1, &r2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &r1, &r2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::QuotMk(a1), Value::QuotMk(a2)) => {
-            conv_typed(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::QuotLift, Value::QuotLift) => Ok(true),
         (Value::QuotInd, Value::QuotInd) => Ok(true),
         (Value::QuotSound, Value::QuotSound) => Ok(true),
         (Value::Fst(p1), Value::Fst(p2)) => {
-            conv_typed(level, &p1, &p2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &p1, &p2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::Snd(p1), Value::Snd(p2)) => {
-            conv_typed(level, &p1, &p2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &p1, &p2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         (Value::Match { scrut: s1, mot: m1, l_body: l1, r_body: r1, .. },
          Value::Match { scrut: s2, mot: m2, l_body: l2, r_body: r2, .. }) => {
-            if !conv_typed(level, &s1, &s2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &s1, &s2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
-            if !conv_typed(level, &m1, &m2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &m1, &m2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
             // Branch bodies compare like lambda bodies (shared fresh var).
@@ -1468,7 +1458,7 @@ pub fn conv_typed(
             let lv1 = l1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
             let lv2 = l2.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
             var_types.push(None);
-            let lr = conv_typed(level + 1, &lv1, &lv2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
+            let lr = conv(level + 1, &lv1, &lv2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
             var_types.pop();
             if !lr? {
                 return Ok(false);
@@ -1476,7 +1466,7 @@ pub fn conv_typed(
             let rv1 = r1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
             let rv2 = r2.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
             var_types.push(None);
-            let rr = conv_typed(level + 1, &rv1, &rv2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
+            let rr = conv(level + 1, &rv1, &rv2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
             var_types.pop();
             rr
         }
@@ -1485,7 +1475,7 @@ pub fn conv_typed(
             let v1 = b1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
             let v2 = b2.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
             var_types.push(None);
-            let r = conv_typed(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
+            let r = conv(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
             var_types.pop();
             r
         }
@@ -1495,7 +1485,7 @@ pub fn conv_typed(
             let v1 = body.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
             let v2 = do_apply(other, fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
             var_types.push(None);
-            let r = conv_typed(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
+            let r = conv(level + 1, &v1, &v2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
             var_types.pop();
             r
         }
@@ -1503,10 +1493,11 @@ pub fn conv_typed(
         // non-canonical term (neutrals — which may be Unit-typed). Canonical
         // introductions of other types, sorts, and type formers stay unequal
         // (identical pairs matched above; everything else falls below).
-        // Like function eta, this is sound for well-typed inputs — `conv`
-        // never learns types, so comparing ill-typed terms can over-identify
-        // (same approximation class as cumulativity-in-conversion); the
-        // checker only ever converts elaborated, well-typed terms.
+        // Like function eta, this is sound for well-typed inputs — these
+        // shape arms do not consult types, so comparing ill-typed terms can
+        // over-identify (same approximation class as
+        // cumulativity-in-conversion); the checker only ever converts
+        // elaborated, well-typed terms.
         (Value::Pt, other) | (other, Value::Pt) => {
             match other {
                 Value::Var(_)
@@ -1520,10 +1511,10 @@ pub fn conv_typed(
             }
         }
         (Value::App(f1, a1), Value::App(f2, a2)) => {
-            if !conv_typed(level, &f1, &f2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+            if !conv(level, &f1, &f2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                 return Ok(false);
             }
-            conv_typed(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
+            conv(level, &a1, &a2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
         // Metas (defensive: the checker's unification pre-scans for metas and
         // solves or postpones before calling `conv`, so these arms fire only
@@ -1535,7 +1526,7 @@ pub fn conv_typed(
                 return Ok(false);
             }
             for (a, b) in s1.iter().zip(s2.iter()) {
-                if !conv_typed(level, a, b, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
+                if !conv(level, a, b, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
                     return Ok(false);
                 }
             }
@@ -2114,7 +2105,7 @@ mod tests {
         let lam_v = eval(&lam_core, &f, &globals).unwrap();
         let f_v = Value::Var(0);
         let mut fuel = FUEL_LIMIT;
-        assert!(conv(1, &lam_v, &f_v, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(conv(1, &lam_v, &f_v, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap());
     }
 
     #[test]
@@ -2174,7 +2165,7 @@ mod tests {
         let globals = GlobalVals::new();
         let t = |a: &Value, b: &Value| {
             let mut fuel = FUEL_LIMIT;
-            conv(0, a, b, &globals, &mut fuel, 0, &mut Vec::new()).unwrap()
+            conv(0, a, b, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap()
         };
         let pt = Value::Pt;
         // Neutrals: equal (both directions).
@@ -2205,10 +2196,12 @@ mod tests {
             0,
             &Value::Sort(Sort::Type(Level::Const(0))),
             &Value::Sort(Sort::Type(Level::Const(1))),
+            &mut Vec::new(),
             &globals,
             &mut fuel,
             0,
-            &mut Vec::new()
+            &mut Vec::new(),
+            true
         )
         .unwrap());
         // ... and nothing lifts down into `*` ...
@@ -2216,10 +2209,12 @@ mod tests {
             0,
             &Value::Sort(Sort::Type(Level::Const(0))),
             &Value::Sort(Sort::Star),
+            &mut Vec::new(),
             &globals,
             &mut fuel,
             0,
-            &mut Vec::new()
+            &mut Vec::new(),
+            true
         )
         .unwrap());
         // ... and `*` does NOT convert into `Type` (conversion is equality;
@@ -2231,20 +2226,24 @@ mod tests {
             0,
             &Value::Sort(Sort::Star),
             &Value::Sort(Sort::Type(Level::Const(0))),
+            &mut Vec::new(),
             &globals,
             &mut fuel,
             0,
-            &mut Vec::new()
+            &mut Vec::new(),
+            true
         )
         .unwrap());
         assert!(!conv(
             0,
             &Value::Sort(Sort::Star),
             &Value::Sort(Sort::Type(Level::Var(7))),
+            &mut Vec::new(),
             &globals,
             &mut fuel,
             0,
-            &mut Vec::new()
+            &mut Vec::new(),
+            true
         )
         .unwrap());
     }
@@ -2415,9 +2414,9 @@ mod tests {
         let w = whnf(&app, &globals, &mut fuel).unwrap();
         assert!(matches!(w, Value::App(_, _)));
         let mut fuel = FUEL_LIMIT;
-        assert!(conv(0, &Value::Absurd, &Value::Absurd, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(conv(0, &Value::Absurd, &Value::Absurd, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap());
         let mut fuel = FUEL_LIMIT;
-        assert!(!conv(0, &Value::Absurd, &Value::Void, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(!conv(0, &Value::Absurd, &Value::Void, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap());
     }
 
     #[test]
@@ -2453,7 +2452,7 @@ mod tests {
         let pair = Core::Pair(Box::new(Core::Sort(Sort::Star)), Box::new(Core::Sort(Sort::Star)));
         let sv = eval(&sigma, &empty, &globals).unwrap();
         let pv = eval(&pair, &empty, &globals).unwrap();
-        assert!(!conv(0, &sv, &pv, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(!conv(0, &sv, &pv, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap());
     }
 
     #[test]
@@ -2467,17 +2466,17 @@ mod tests {
             Box::new(Value::Fst(Box::new(Value::Var(0)))),
             Box::new(Value::Snd(Box::new(Value::Var(0)))),
         );
-        assert!(conv(0, &p, &eta, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(conv(0, &p, &eta, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap());
         // Control: different neutrals stay unequal through eta.
         let mut fuel = FUEL_LIMIT;
         let q = Value::Pair(
             Box::new(Value::Fst(Box::new(Value::Var(1)))),
             Box::new(Value::Snd(Box::new(Value::Var(1)))),
         );
-        assert!(!conv(0, &p, &q, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(!conv(0, &p, &q, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap());
         // Canonicals of other types never expand.
         let mut fuel = FUEL_LIMIT;
         let inl = Value::Inl(Box::new(Value::Var(0)));
-        assert!(!conv(0, &eta, &inl, &globals, &mut fuel, 0, &mut Vec::new()).unwrap());
+        assert!(!conv(0, &eta, &inl, &mut Vec::new(), &globals, &mut fuel, 0, &mut Vec::new(), true).unwrap());
     }
 }

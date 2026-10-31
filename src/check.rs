@@ -164,7 +164,7 @@
 //! and `Type5` alike (pinned by tests below); conflicting requirements never
 //! meet across uses. Primitives are schematic for free (fresh variables per
 //! `infer` call, no retained constraints).
-use crate::core::{pretty_core, pretty_value, conv_typed, eval, whnf, subst_level_value, level_vars_value, level_vars_constraint, Closure, Core, Env, EvalError, GlobalDef, GlobalVals, Sort, Value, FUEL_LIMIT, DEPTH_LIMIT};
+use crate::core::{pretty_core, pretty_value, conv, eval, whnf, subst_level_value, level_vars_value, level_vars_constraint, Closure, Core, Env, EvalError, GlobalDef, GlobalVals, Sort, Value, FUEL_LIMIT, DEPTH_LIMIT};
 use crate::levels::{subst_level_constraint, Constraint, Level, Rel, check_satisfiable, fresh_level_var};
 use crate::subst::{subst_val, contains_meta, occurs_meta, free_levels_value};
 use crate::lexer::{Span, line_col};
@@ -2089,7 +2089,7 @@ impl Checker {
         let mut fuel2 = FUEL_LIMIT;
         let mut ucs = self.ucons.borrow_mut();
         let mut var_types = ctx.conv_types(level);
-        match conv_typed(level, &wa, &wb, &mut var_types, &self.gvals, &mut fuel2, 0, &mut ucs, true) {
+        match conv(level, &wa, &wb, &mut var_types, &self.gvals, &mut fuel2, 0, &mut ucs, true) {
             Ok(true) => Ok(UOut::Eq),
             Ok(false) => Ok(UOut::Mismatch),
             Err(e) => Err(CheckError::from(e)),
@@ -2143,7 +2143,7 @@ impl Checker {
                 let mut fuel = FUEL_LIMIT;
                 let mut ucs = self.ucons.borrow_mut();
                 let mut var_types = ctx.conv_types(level);
-                match conv_typed(level, a, b, &mut var_types, &self.gvals, &mut fuel, 0, &mut ucs, true) {
+                match conv(level, a, b, &mut var_types, &self.gvals, &mut fuel, 0, &mut ucs, true) {
                     Ok(true) => Ok(UOut::Eq),
                     Ok(false) => Ok(UOut::Mismatch),
                     Err(e) => Err(CheckError::from(e)),
@@ -2879,7 +2879,7 @@ impl Checker {
                 let mut fuel3 = FUEL_LIMIT;
                 let mut ucs = self.ucons.borrow_mut();
                 let mut var_types = ctx.conv_types(ctx.len());
-                match conv_typed(ctx.len(), &wi, &we, &mut var_types, &self.gvals, &mut fuel3, 0, &mut ucs, true) {
+                match conv(ctx.len(), &wi, &we, &mut var_types, &self.gvals, &mut fuel3, 0, &mut ucs, true) {
                     Ok(b) => Ok(b),
                     Err(e) => Err(CheckError::from(e)),
                 }
@@ -3601,7 +3601,6 @@ fn snippet(src: &str, span: Span) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::conv;
 
     fn ok(src: &str) -> Checker {
         let c = check_program(src).expect("parse failed");
@@ -3837,7 +3836,7 @@ mod tests {
             let surface_val = eval(&core, &empty, &checker.gvals).expect("eval W type");
             let prim_val = checker.infer(prim, &ctx).expect("infer W primitive");
             let mut fuel = FUEL_LIMIT;
-            let eq = conv(0, &surface_val, &prim_val, &checker.gvals, &mut fuel, 0, &mut Vec::new())
+            let eq = conv(0, &surface_val, &prim_val, &mut Vec::new(), &checker.gvals, &mut fuel, 0, &mut Vec::new(), true)
                 .expect("conv W type");
             if !eq {
                 let ps = crate::core::pretty_value(&surface_val, 0, &checker.gvals, &[]);
@@ -4361,7 +4360,7 @@ mod tests {
         let prim_val = checker.infer(&Core::UnitRect, &ctx).expect("infer unit_rect");
         let mut fuel = FUEL_LIMIT;
         assert!(
-            conv(0, &surface_val, &prim_val, &checker.gvals, &mut fuel, 0, &mut Vec::new())
+            conv(0, &surface_val, &prim_val, &mut Vec::new(), &checker.gvals, &mut fuel, 0, &mut Vec::new(), true)
                 .expect("conv unit_rect type"),
             "hand-built unit_rect type differs from surface spelling"
         );
@@ -4419,7 +4418,7 @@ mod tests {
         let prim_val = checker.infer(&Core::EitherRect, &ctx).expect("infer either_rect");
         let mut fuel = FUEL_LIMIT;
         assert!(
-            conv(0, &surface_val, &prim_val, &checker.gvals, &mut fuel, 0, &mut Vec::new())
+            conv(0, &surface_val, &prim_val, &mut Vec::new(), &checker.gvals, &mut fuel, 0, &mut Vec::new(), true)
                 .expect("conv either_rect type"),
             "hand-built either_rect type differs from surface spelling"
         );
@@ -4534,7 +4533,7 @@ mod tests {
         let prim_val = checker.infer(&Core::QuotLift, &ctx).expect("infer quot_lift");
         let mut fuel = FUEL_LIMIT;
         assert!(
-            conv(0, &surface_val, &prim_val, &checker.gvals, &mut fuel, 0, &mut Vec::new())
+            conv(0, &surface_val, &prim_val, &mut Vec::new(), &checker.gvals, &mut fuel, 0, &mut Vec::new(), true)
                 .expect("conv quot_lift type"),
             "hand-built quot_lift type differs from surface spelling"
         );
@@ -4557,7 +4556,7 @@ mod tests {
         let prim_val = checker.infer(&Core::QuotSound, &ctx).expect("infer quot_sound");
         let mut fuel = FUEL_LIMIT;
         assert!(
-            conv(0, &surface_val, &prim_val, &checker.gvals, &mut fuel, 0, &mut Vec::new())
+            conv(0, &surface_val, &prim_val, &mut Vec::new(), &checker.gvals, &mut fuel, 0, &mut Vec::new(), true)
                 .expect("conv quot_sound type"),
             "hand-built quot_sound type differs from surface spelling"
         );
@@ -4631,7 +4630,7 @@ mod tests {
         let prim_val = checker.infer(&Core::QuotInd, &ctx).expect("infer quot_ind");
         let mut fuel = FUEL_LIMIT;
         assert!(
-            conv(0, &surface_val, &prim_val, &checker.gvals, &mut fuel, 0, &mut Vec::new())
+            conv(0, &surface_val, &prim_val, &mut Vec::new(), &checker.gvals, &mut fuel, 0, &mut Vec::new(), true)
                 .expect("conv quot_ind type"),
             "hand-built quot_ind type differs from surface spelling"
         );
@@ -4668,7 +4667,7 @@ mod tests {
         let prim_val = checker.infer(&Core::SigRect, &ctx).expect("infer sig_rect");
         let mut fuel = FUEL_LIMIT;
         assert!(
-            conv(0, &surface_val, &prim_val, &checker.gvals, &mut fuel, 0, &mut Vec::new())
+            conv(0, &surface_val, &prim_val, &mut Vec::new(), &checker.gvals, &mut fuel, 0, &mut Vec::new(), true)
                 .expect("conv sig_rect type"),
             "hand-built sig_rect type differs from surface spelling"
         );

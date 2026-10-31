@@ -265,7 +265,7 @@ def leftIsUnit : Unit = either_rect Unit Unit (\_. Unit) (\_. ()) (\_. ()) (inl 
 ## PMCT eta: `(P:T -> *) -> P v -> P v`
 
 - **Formation**: ordinary Pi formation (the family is small, `P : T -> *`).
-- **Eta** (type-directed, `conv_typed` / `pmct_eta_normalize`
+- **Eta** (type-directed, `conv` / `pmct_eta_normalize`
   `src/core.rs`): any `p` whose type unfolds to
   `(P:T -> *) -> P v -> P v` converts with `\P x. x`; consequently
   `p P x ≡ x` for every `P` and `x : P v`.
@@ -276,10 +276,9 @@ def leftIsUnit : Unit = either_rect Unit Unit (\_. Unit) (\_. ()) (\_. ()) (inl 
   deliberately restricted to `P : T -> *`; the large-family version
   (`P : T -> Type`) is not identified.
 - Unlike the shape-only Sigma/Unit arms, this rule needs the type of the
-  neutral, so conversion is threaded with the checker's variable and
-  global type environments (`conv_typed`); the plain `conv` wrapper uses
-  no variable types and therefore only sees the rule through
-  `conv_typed` callers.
+  neutral, so the single conversion entry point (`conv`) is always
+  threaded with variable types and global recorded types; there is no
+  untyped conversion API.
 - **Pin**: `pmct_eta_holds` (`src/check.rs`) checks both
   `p ≡ \P x. x` and `p P x ≡ x`, and rejects the same claims for
   `f : A -> A` and for `P : T -> Type`.
