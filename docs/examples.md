@@ -11,7 +11,7 @@ file documents one boundary and is pinned by a test in `src/check.rs` or
 | File | What it proves |
 |---|---|
 | `prelude.sig` | Polymorphic `id`, `const`, `compose`, `* -> *` application, impredicative `P : * -> *` use, annotated/inferred `let`, eta. |
-| `path.sig` | Definitional Leibniz `path`, `path_subst`, `id_path`, `path_symm`, computation `id_subst` by delta+beta. No primitive `Eq`. |
+| `path.sig` | Definitional Leibniz `path`, `path_subst`, `id_path`, `path_symm`, computation `id_subst` by delta+beta, and PMCT eta 1/2 (`pmct_eta_1`/`pmct_eta_2`) via large-domain function extensionality. No primitive `Eq`. |
 | `void.sig` | `exfalso`, `absurdVoid`, explosion at `T -> T`. No closed `Void` inhabitant exists. |
 | `sigma.sig` | Small/large Sigma formation (`Void and * : Type0`), intro, `fst`/`snd`, `fst` applying through, `sig_rect`-defined projections. |
 | `either.sig` | Small/large sums, `inl`/`inr` intro, full case `either_rect`, predicative large elimination into `Type0`. |

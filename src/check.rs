@@ -3765,6 +3765,17 @@ mod tests {
     }
 
     #[test]
+    fn path_sig_checks_end_to_end() {
+        let src = include_str!("../examples/path.sig");
+        let checker = check_program(src).expect("path.sig must parse");
+        assert!(
+            !checker.has_errors(),
+            "path.sig must check:\n{}",
+            checker.report()
+        );
+    }
+
+    #[test]
     fn bad_application_rejected() {
         // `f` takes one arg; the second application hits non-function `Type0`.
         fails("def f : * -> Type0 = \\x. x; def b : Type0 = f * *;");
