@@ -84,8 +84,9 @@ primitive `Eq`, no `Prop` sort.
 
 ## Conversion vs subsumption
 
-Conversion (`src/core.rs:conv`) is *equality*: beta/delta + eta for functions,
-pairs, and Unit; sorts by equality (distinct concrete levels fail; variable-involving sorts
+Conversion (`src/core.rs:conv_typed`) is *equality*: beta/delta + eta for
+functions, pairs, and Unit, plus the type-directed PMCT eta; sorts by
+equality (distinct concrete levels fail; variable-involving sorts
 record both-direction `<=` and hold). `*` does *not* lift inside `conv`.
 
 One-directional cumulativity (`*` and lower levels lift) and function
@@ -94,6 +95,17 @@ checker's `expect_conv` / `require_sort_le`, not in `conv`. This keeps small
 and large motive families from being equated inside conversion
 (`liftPath`-shaped ascriptions stay rejected) while `*`-motives still check
 against level-general primitives through subsumption.
+
+PMCT eta is the one type-directed conversion arm (`conv_typed`,
+`pmct_eta_normalize`). Conversion is threaded with the variable types of
+the checker's context and with each global's recorded type (`GlobalDef.ty`).
+A neutral whose type unfolds to `(P:T -> *) -> P v -> P v` normalizes to
+`\P x. x`, so an application rooted at it drops to its second argument
+(`p P x ≡ x`). This is a parametricity/free-theorem premise, stronger than
+ordinary function eta, and is deliberately restricted to small predicates
+`P : T -> *`; `P : T -> Type` does not get the rule. The bare `conv`
+wrapper passes an empty variable-type environment (tests and untyped
+callers still get the shape-only etas, not PMCT eta).
 
 Evaluation is fuel-bounded (`FUEL_LIMIT = 400_000`) with nesting caps
 (`EVAL_DEPTH_LIMIT`, `DEPTH_LIMIT`). Divergence and hostile nesting become
@@ -160,7 +172,7 @@ Leibniz inlined); iota on canonical classes. `quot_ind` is dependent with
 transport-stated coherence and `*`-motives (Leibniz transport applies the
 proof to `P` itself, which needs `P : Q -> *` — same reason `path_subst`
 pins its motive). `quot_sound A R a b h` turns `R`-proofs into `path` proofs
-— the one axiom (stuck-neutral, no exactness/reflection).
+— the primitive axiom (stuck-neutral, no exactness/reflection).
 
 `Squash A` is derived as `Quot A` by the trivial relation. `squash_rect`
 needs an explicit constancy proof; that obligation is what makes Prop-free

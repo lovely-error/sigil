@@ -164,7 +164,7 @@
 //! and `Type5` alike (pinned by tests below); conflicting requirements never
 //! meet across uses. Primitives are schematic for free (fresh variables per
 //! `infer` call, no retained constraints).
-use crate::core::{pretty_core, pretty_value, conv, eval, whnf, subst_level_value, level_vars_value, level_vars_constraint, Closure, Core, Env, EvalError, GlobalDef, GlobalVals, Sort, Value, FUEL_LIMIT, DEPTH_LIMIT};
+use crate::core::{pretty_core, pretty_value, conv_typed, eval, whnf, subst_level_value, level_vars_value, level_vars_constraint, Closure, Core, Env, EvalError, GlobalDef, GlobalVals, Sort, Value, FUEL_LIMIT, DEPTH_LIMIT};
 use crate::levels::{subst_level_constraint, Constraint, Level, Rel, check_satisfiable, fresh_level_var};
 use crate::subst::{subst_val, contains_meta, occurs_meta, free_levels_value};
 use crate::lexer::{Span, line_col};
@@ -521,6 +521,13 @@ impl Ctx {
     fn pop(&mut self) {
         self.types.pop();
         self.values.pop();
+    }
+    fn conv_types(&self, level: usize) -> Vec<Option<Value>> {
+        let mut types: Vec<Option<Value>> = self.types.iter().cloned().map(Some).collect();
+        while types.len() < level {
+            types.push(None);
+        }
+        types
     }
 }
 
@@ -933,8 +940,12 @@ impl Checker {
                 }
                 let scheme = Scheme { vars, constraints: retained };
                 self.gnames.push(name.clone());
-                self.gtypes.push(Some(ty_v));
-                self.gvals.push(Some(GlobalDef { value: val_v, levels: scheme.vars.clone() }));
+                self.gtypes.push(Some(ty_v.clone()));
+                self.gvals.push(Some(GlobalDef {
+                    value: val_v,
+                    ty: ty_v,
+                    levels: scheme.vars.clone(),
+                }));
                 self.gschemes.push(scheme);
                 self.failed.push(false);
                 self.decls.push(Decl { name, ty: ty_core, val: val_core, ok: true, error: None });
@@ -1187,8 +1198,12 @@ impl Checker {
             return;
         }
         self.gnames.push(name.clone());
-        self.gtypes.push(Some(ty_v));
-        self.gvals.push(Some(GlobalDef { value: lam_v, levels: scheme.vars.clone() }));
+        self.gtypes.push(Some(ty_v.clone()));
+        self.gvals.push(Some(GlobalDef {
+            value: lam_v,
+            ty: ty_v,
+            levels: scheme.vars.clone(),
+        }));
         self.gschemes.push(scheme);
         self.failed.push(false);
         self.decls.push(Decl { name, ty: ty_core, val: lam_core, ok: true, error: None });
@@ -2073,7 +2088,8 @@ impl Checker {
         }
         let mut fuel2 = FUEL_LIMIT;
         let mut ucs = self.ucons.borrow_mut();
-        match conv(level, &wa, &wb, &self.gvals, &mut fuel2, 0, &mut ucs) {
+        let mut var_types = ctx.conv_types(level);
+        match conv_typed(level, &wa, &wb, &mut var_types, &self.gvals, &mut fuel2, 0, &mut ucs, true) {
             Ok(true) => Ok(UOut::Eq),
             Ok(false) => Ok(UOut::Mismatch),
             Err(e) => Err(CheckError::from(e)),
@@ -2126,7 +2142,8 @@ impl Checker {
             | (Value::Global(_, _), Value::Global(_, _)) => {
                 let mut fuel = FUEL_LIMIT;
                 let mut ucs = self.ucons.borrow_mut();
-                match conv(level, a, b, &self.gvals, &mut fuel, 0, &mut ucs) {
+                let mut var_types = ctx.conv_types(level);
+                match conv_typed(level, a, b, &mut var_types, &self.gvals, &mut fuel, 0, &mut ucs, true) {
                     Ok(true) => Ok(UOut::Eq),
                     Ok(false) => Ok(UOut::Mismatch),
                     Err(e) => Err(CheckError::from(e)),
@@ -2861,7 +2878,8 @@ impl Checker {
                 }
                 let mut fuel3 = FUEL_LIMIT;
                 let mut ucs = self.ucons.borrow_mut();
-                match conv(ctx.len(), &wi, &we, &self.gvals, &mut fuel3, 0, &mut ucs) {
+                let mut var_types = ctx.conv_types(ctx.len());
+                match conv_typed(ctx.len(), &wi, &we, &mut var_types, &self.gvals, &mut fuel3, 0, &mut ucs, true) {
                     Ok(b) => Ok(b),
                     Err(e) => Err(CheckError::from(e)),
                 }
@@ -3583,6 +3601,7 @@ fn snippet(src: &str, span: Span) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::conv;
 
     fn ok(src: &str) -> Checker {
         let c = check_program(src).expect("parse failed");
@@ -4298,6 +4317,20 @@ mod tests {
         ok("def peta : (A:*) -> (B:A -> *) -> (p:(x:A) and B x) -> (P:(((x:A) and B x) -> *)) -> P p -> P (fst p, snd p) = \\A B p P x. x;");
         // Eta does not over-identify: distinct neutrals stay unequal.
         fails("def bad : (A:*) -> (p:(x:A) and A) -> (q:(x:A) and A) -> (P:(((x:A) and A) -> *)) -> P p -> P q = \\A p q P x. x;");
+    }
+
+    #[test]
+    fn pmct_eta_holds() {
+        ok("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
+            def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
+            def pmct_eta_1 : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) -> path ((P:(T -> *)) -> P v -> P v) p (\\P x. x) = \\T v p. id_path ((P:(T -> *)) -> P v -> P v) p; \
+            def pmct_beta : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) -> (P:(T -> *)) -> (x:P v) -> path (P v) (p P x) x = \\T v p P x. id_path (P v) x;");
+        fails("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
+               def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
+               def bad : (A:*) -> (f:A -> A) -> (x:A) -> path A (f x) x = \\A f x. id_path A x;");
+        fails("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
+               def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
+               def large : (T:*) -> (v:T) -> (p:(P:(T -> Type)) -> P v -> P v) -> path ((P:(T -> Type)) -> P v -> P v) p (\\P x. x) = \\T v p. id_path ((P:(T -> Type)) -> P v -> P v) p;");
     }
 
     #[test]

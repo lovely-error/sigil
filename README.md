@@ -8,7 +8,8 @@ Fuel-bounded evaluation makes the checker total: divergence and hostile
 input are reported errors, never a hang. Every rule is documented
 ([`docs/rules.md`](docs/rules.md)), and soundness is an auditable inventory
 of trusted premises ([`docs/soundness.md`](docs/soundness.md)): one adopted
-axiom (`quot_sound`), no mechanized metatheory yet.
+axiom (`quot_sound`) plus a type-directed PMCT eta rule, no mechanized
+metatheory yet.
 
 ## Quick start
 

@@ -86,6 +86,31 @@ and the pin.
 - **Known limitation** (see *Not claimed* below): the contract is
   enforced by code paths and tests, not by an engine-internal argument.
 
+### PMCT eta (parametricity)
+
+- **Rule**: any `p : (P:T -> *) -> P v -> P v` converts with `\P x. x`;
+  consequently `p P x ≡ x` for all `P` and `x : P v`.
+- **Premise**: this is the parametricity/free-theorem principle behind
+  `axiom pmct_eta_1` in Lean — a uniformity property of polymorphic
+  terms, not an ordinary beta/delta/eta computation. It is an *adopted
+  trusted rule*, alongside `quot_sound`. The rule is restricted to small
+  predicate families `P : T -> *`; `P : T -> Type` is deliberately not
+  identified.
+- **Enforcement**: unlike the shape-only etas, this arm is type-directed
+  (`conv_typed` / `pmct_eta_normalize`, `src/core.rs`). Conversion is
+  threaded with the context's variable types and each global's recorded
+  type (`GlobalDef.ty`), and normalizes a neutral of that type to the
+  identity before comparing, plus applications rooted at it to their
+  second argument. Pins: `pmct_eta_holds` (`src/check.rs`) checks the
+  positive claims and rejects the analogous claims for `f : A -> A` and
+  for `P : T -> Type`.
+- **Known limitation**: the value-level type oracle only reconstructs
+  types for neutral forms it knows (`Var`, `Global`, `App`, `Fst`,
+  `Snd`, `Match`); binder types introduced inside conversion's own
+  lambda-eta expansion are unknown. That can make the rule miss an
+  exotic nested occurrence, but never fires it on the wrong type:
+  missing a reduction only loses completeness.
+
 ### Sigma (pairs)
 
 - **Introduction** (`check_pair` `src/check.rs:2876`): `(a, b)` checks
@@ -166,11 +191,13 @@ and the pin.
   non-dependent `B`; the dependent eliminator `quot_ind` is pinned to
   `*`-motives with transport-stated coherence, the same shape that makes
   Lean's `Quot.ind` sound.
-- **`quot_sound`** is the system's one axiom (stuck-neutral, no iota, no
-  exactness/reflection ✗ `examples/fail_quot_stuck.sig`): relation proofs
-  become `path` proofs between classes. Consistency is *relative to* the
-  set-quotient model — the same standing Lean-type-theoretic axiom, not a
-  computation rule.
+- **`quot_sound`** is the system's primitive axiom (stuck-neutral, no
+  iota, no exactness/reflection ✗ `examples/fail_quot_stuck.sig`):
+  relation proofs become `path` proofs between classes. Consistency is
+  *relative to* the set-quotient model — the same standing
+  Lean-type-theoretic axiom, not a computation rule. The only other
+  adopted identification is [PMCT eta](#pmct-eta-parametricity), which is
+  a conversion rule rather than a term former.
 - **`Squash`** (derived): elimination requires an explicit constancy
   proof, which is precisely the obligation that makes Prop-free
   truncation sound; computation holds definitionally
@@ -224,7 +251,9 @@ Honest boundaries of the current assurance:
    normalizability is empirical, backed by no fixpoints/no
    forward-refs + the ECC anchor.
 3. **`quot_sound` is an adopted axiom** — consistent relative to a
-   set-quotient model, but the model is not built here.
+   set-quotient model, but the model is not built here. **PMCT eta is an
+   adopted parametricity principle**; consistency is relative to a
+   parametric model of the calculus, which is likewise not built here.
 4. **No mechanized metatheory.** The pen-and-paper subject-reduction
    argument is distributed across the code comments above.
 

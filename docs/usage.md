@@ -118,8 +118,9 @@ Notes:
 | Case | `match e return P { inl a => b1 \| inr b => b2 }` | exactly one `inl` + one `inr`, either order, no nesting |
 | Quotients | `Quot A R`, `quot_mk a` | `quot_mk` check-only like injections |
 | Quot elim | `quot_lift A R B f h q`, `quot_ind A R P f coh q` | `h`/`coh` explicit; iota on `quot_mk` |
-| Quot axiom | `quot_sound A R a b h` | stuck-neutral, the one axiom |
+| Quot axiom | `quot_sound A R a b h` | stuck-neutral, the primitive axiom |
 | Unit | `Unit`, `()`, `unit_rect P b u` | `()` infers; every neutral `u : Unit` converts with `()` |
+| PMCT eta | `p:(P:(T -> *)) -> P v -> P v` | type-directed: `p` converts with `\P x. x`, so `p P x` converts with `x` |
 | Trees | `W A B`, `sup A B a f`, `w_rect A B P s w` | all args explicit |
 | Holes | `_` in term position, `def t : _ = ()` | see below |
 

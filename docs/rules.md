@@ -21,8 +21,9 @@ boundary is pinned in an `examples/fail_*.sig` file (tour in
   `src/check.rs` header). Primitives inline it rather than depending on
   the derived `path` — that is why the notation exists.
 - `≡` — definitional equality: holds in `conv` (`src/core.rs:1062`, NbE —
-  beta + delta + iota + eta), so it needs no proof term. `quot_sound` is
-  the one axiom: equations between classes go through that proof.
+  beta + delta + iota + eta, including the type-directed PMCT eta), so it
+  needs no proof term. `quot_sound` is the primitive axiom: equations
+  between classes go through that proof.
 
 ## Checking direction
 
@@ -261,6 +262,34 @@ def unitVal : Unit = ();
 def leftIsUnit : Unit = either_rect Unit Unit (\_. Unit) (\_. ()) (\_. ()) (inl ());
 ```
 
+## PMCT eta: `(P:T -> *) -> P v -> P v`
+
+- **Formation**: ordinary Pi formation (the family is small, `P : T -> *`).
+- **Eta** (type-directed, `conv_typed` / `pmct_eta_normalize`
+  `src/core.rs`): any `p` whose type unfolds to
+  `(P:T -> *) -> P v -> P v` converts with `\P x. x`; consequently
+  `p P x ≡ x` for every `P` and `x : P v`.
+- This is the parametricity/free-theorem principle behind the Lean axiom
+  `axiom pmct_eta_1 {v:T} (p : (P:T -> Sort _) -> P v -> P v) :
+  p = fun _ x => x`. It is stronger than ordinary function eta and is an
+  adopted trusted rule, not a derivable computation rule. It is
+  deliberately restricted to `P : T -> *`; the large-family version
+  (`P : T -> Type`) is not identified.
+- Unlike the shape-only Sigma/Unit arms, this rule needs the type of the
+  neutral, so conversion is threaded with the checker's variable and
+  global type environments (`conv_typed`); the plain `conv` wrapper uses
+  no variable types and therefore only sees the rule through
+  `conv_typed` callers.
+- **Pin**: `pmct_eta_holds` (`src/check.rs`) checks both
+  `p ≡ \P x. x` and `p P x ≡ x`, and rejects the same claims for
+  `f : A -> A` and for `P : T -> Type`.
+
+```sigil
+def pmct_beta : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) ->
+  (P:(T -> *)) -> (x:P v) -> path (P v) (p P x) x =
+  \T v p P x. id_path (P v) x;
+```
+
 ## W: `W A B` (well-founded trees)
 
 - **Formation** (`w_type` `src/check.rs:1446` — the only hand-built type
@@ -331,7 +360,7 @@ def wzero : WNat = sup Bool Bf (inl ()) (\x. absurd WNat x);
     dependent, `*`-motives only, coherence `coh` stated via `quot_sound`
     transport (`docs/theory.md` why).
   - `quot_sound A R a b h : path (Quot A R) (quot_mk a) (quot_mk b)`
-    (`quot_sound_type` `src/check.rs:3308`) — the one axiom: turns
+    (`quot_sound_type` `src/check.rs:3308`) — the primitive axiom: turns
     relation proofs into equality proofs.
 - **Computation**:
 
