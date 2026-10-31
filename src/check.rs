@@ -4324,13 +4324,20 @@ mod tests {
         ok("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
             def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
             def pmct_eta_1 : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) -> path ((P:(T -> *)) -> P v -> P v) p (\\P x. x) = \\T v p. id_path ((P:(T -> *)) -> P v -> P v) p; \
-            def pmct_beta : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) -> (P:(T -> *)) -> (x:P v) -> path (P v) (p P x) x = \\T v p P x. id_path (P v) x;");
+            def pmct_beta : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) -> (P:(T -> *)) -> (x:P v) -> path (P v) (p P x) x = \\T v p P x. id_path (P v) x; \
+            def pmct_eq : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) -> (q:(P:(T -> *)) -> P v -> P v) -> path ((P:(T -> *)) -> P v -> P v) p q = \\T v p q. id_path ((P:(T -> *)) -> P v -> P v) p;");
         fails("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
                def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
                def bad : (A:*) -> (f:A -> A) -> (x:A) -> path A (f x) x = \\A f x. id_path A x;");
+        ok("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
+            def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
+            def constPmct : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P ((\\_. v) P) -> P ((\\_. v) P)) -> path ((P:(T -> *)) -> P ((\\_. v) P) -> P ((\\_. v) P)) p (\\P x. x) = \\T v p. id_path ((P:(T -> *)) -> P ((\\_. v) P) -> P ((\\_. v) P)) p;");
         fails("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
                def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
                def large : (T:*) -> (v:T) -> (p:(P:(T -> Type)) -> P v -> P v) -> path ((P:(T -> Type)) -> P v -> P v) p (\\P x. x) = \\T v p. id_path ((P:(T -> Type)) -> P v -> P v) p;");
+        fails("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
+               def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
+               def dependentIndex : (T:*) -> (f:(T -> *) -> T) -> (p:(P:(T -> *)) -> P (f P) -> P (f P)) -> (P:(T -> *)) -> (x:P (f P)) -> path (P (f P)) (p P x) x = \\T f p P x. id_path (P (f P)) x;");
     }
 
     #[test]

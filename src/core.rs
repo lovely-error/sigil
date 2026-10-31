@@ -20,7 +20,7 @@ use std::fmt;
 use crate::levels::{Constraint, Level, Rel};
 
 use crate::lexer::Span;
-use crate::subst::contains_meta;
+use crate::subst::{contains_meta, free_levels_value};
 
 /// Evaluation fuel: bounds beta/delta steps so diverging terms (e.g.
 /// `(\x. x x) (\x. x x)`) become errors instead of hangs. Calibrated at
@@ -1127,10 +1127,13 @@ fn is_pmct_eta_type(
     depth: u32,
     ucs: &mut Vec<Constraint>,
 ) -> Result<bool, EvalError> {
-    if depth > DEPTH_LIMIT {
+    if depth > DEPTH_LIMIT || contains_meta(ty) {
         return Ok(false);
     }
     let ty = whnf(ty, globals, fuel)?;
+    if contains_meta(&ty) {
+        return Ok(false);
+    }
     let Value::Pi { dom: pdom, cod: outer_cod, .. } = ty else {
         return Ok(false);
     };
@@ -1161,6 +1164,13 @@ fn is_pmct_eta_type(
     };
     if !matches!(head2.as_ref(), Value::Var(i) if *i == level) {
         return Ok(false);
+    }
+    for v in [&arg, &arg2] {
+        let mut levels = Vec::new();
+        free_levels_value(v, &mut levels);
+        if levels.iter().any(|l| *l >= level) {
+            return Ok(false);
+        }
     }
     let mut local_types = Vec::new();
     let mut local_ucs = Vec::new();
@@ -1279,35 +1289,31 @@ pub fn conv_typed(
     if *fuel == 0 {
         return Err(EvalError { msg: "evaluation fuel exhausted during conversion".to_string() });
     }
-    while var_types.len() < level {
-        var_types.push(None);
-    }
+    let mut local_var_types = Vec::new();
+    let var_types: &mut Vec<Option<Value>> = if var_types.len() == level {
+        var_types
+    } else {
+        local_var_types.extend(var_types.iter().take(level).cloned());
+        while local_var_types.len() < level {
+            local_var_types.push(None);
+        }
+        &mut local_var_types
+    };
     let use_pmct = allow_pmct && (may_be_pmct(a) || may_be_pmct(b));
-    let a0 = if use_pmct {
-        pmct_eta_normalize(a, level, var_types, globals, fuel, depth, ucs)?
-    } else {
-        a.clone()
-    };
-    let b0 = if use_pmct {
-        pmct_eta_normalize(b, level, var_types, globals, fuel, depth, ucs)?
-    } else {
-        b.clone()
-    };
     // NB: share fuel across both whnfs (no clones of the budget).
-    let wa = whnf(&a0, globals, fuel)?;
-    let wb = whnf(&b0, globals, fuel)?;
-    let wa = if use_pmct {
-        pmct_eta_normalize(&wa, level, var_types, globals, fuel, depth, ucs)?
+    let (wa, wb) = if use_pmct {
+        let a0 = pmct_eta_normalize(a, level, var_types, globals, fuel, depth, ucs)?;
+        let b0 = pmct_eta_normalize(b, level, var_types, globals, fuel, depth, ucs)?;
+        let wa = whnf(&a0, globals, fuel)?;
+        let wb = whnf(&b0, globals, fuel)?;
+        let wa = pmct_eta_normalize(&wa, level, var_types, globals, fuel, depth, ucs)?;
+        let wb = pmct_eta_normalize(&wb, level, var_types, globals, fuel, depth, ucs)?;
+        let wa = whnf(&wa, globals, fuel)?;
+        let wb = whnf(&wb, globals, fuel)?;
+        (wa, wb)
     } else {
-        wa
+        (whnf(a, globals, fuel)?, whnf(b, globals, fuel)?)
     };
-    let wb = if use_pmct {
-        pmct_eta_normalize(&wb, level, var_types, globals, fuel, depth, ucs)?
-    } else {
-        wb
-    };
-    let wa = whnf(&wa, globals, fuel)?;
-    let wb = whnf(&wb, globals, fuel)?;
     match (wa, wb) {
         (Value::Sort(x), Value::Sort(y)) => Ok(conv_sort_eq(x, y, ucs)),
         (Value::Void, Value::Void) => Ok(true),
