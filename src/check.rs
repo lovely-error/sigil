@@ -590,6 +590,14 @@ enum UOut {
     Mismatch,
 }
 
+fn combine_unify(a: UOut, b: UOut) -> UOut {
+    match (a, b) {
+        (UOut::Mismatch, _) | (_, UOut::Mismatch) => UOut::Mismatch,
+        (UOut::Defer, _) | (_, UOut::Defer) => UOut::Defer,
+        _ => UOut::Eq,
+    }
+}
+
 /// One elaborated `_` hole: at most one metavariable per surface hole per
 /// definition (re-encounters — e.g. quote-then-infer roundtrips — resolve the
 /// same id; see `ensure_meta`).
@@ -1265,8 +1273,12 @@ impl Checker {
                 self.check_ty(b, ctx)?;
                 eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from)
             }
-            Core::Fst(p) | Core::Snd(p) => {
-                self.check_ty(p, ctx)?;
+            Core::Fst(_) | Core::Snd(_) => {
+                self.infer(ty, ctx)?;
+                eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from)
+            }
+            Core::App(_, _) | Core::Match { .. } => {
+                self.infer(ty, ctx)?;
                 eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from)
             }
             _ => eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from),
@@ -1669,13 +1681,13 @@ impl Checker {
                 }
             }
             Core::App(f, a) => {
+                let fty = self.infer(f, ctx)?;
                 // Full `W A B` spine: the result level computes from the
                 // actuals (predicative max, concrete when they are), not from
                 // the floating `w_type` variable (which only lower-bounds).
                 if let Some(ty) = self.infer_w_app(f, a, ctx)? {
                     return Ok(ty);
                 }
-                let fty = self.infer(f, ctx)?;
                 let mut fuel = FUEL_LIMIT;
                 let w = whnf(&fty, &self.gvals, &mut fuel)?;
                 match w {
@@ -1851,16 +1863,35 @@ impl Checker {
         self.check(body, &goal, &ext)
     }
 
+    /// Validate a term that is not needed for the result type of a
+    /// projection. Check-only introductions are accepted when their payloads
+    /// are inferable: a pair can be typed at a constant Sigma, an injection
+    /// at a sum with `Void` on the other side, and `quot_mk` at a trivial
+    /// quotient. Lambdas still need an annotation (no domain to infer).
+    fn check_inferable(&self, t: &Core, ctx: &Ctx) -> Result<(), CheckError> {
+        match t {
+            Core::Pair(a, b) => {
+                self.check_inferable(a, ctx)?;
+                self.check_inferable(b, ctx)
+            }
+            Core::Inl(a) | Core::Inr(a) | Core::QuotMk(a) => self.check_inferable(a, ctx),
+            _ => {
+                self.infer(t, ctx)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Type of `fst p`: the Sigma's domain. Two cases:
     /// (i) `p` is syntactically a pair (avoids the ambiguity error);
     /// (ii) `p`'s type unfolds to a Sigma (ordinary term-level).
     /// Deliberately NO case for sort-typed `p`: pairs are values only, so
     /// projecting a type is always an error.
     fn infer_fst(&self, p: &Core, ctx: &Ctx) -> Result<Value, CheckError> {
-        if let Core::Pair(a, _) = p {
-            // `fst (a, b)` has the type of `a` (pairs bind nothing, so no
-            // substitution is needed).
-            return self.infer(a, ctx);
+        if let Core::Pair(a, b) = p {
+            let ty = self.infer(a, ctx)?;
+            self.check_inferable(b, ctx)?;
+            return Ok(ty);
         }
         let pty = self.infer(p, ctx)?;
         let mut fuel = FUEL_LIMIT;
@@ -1877,8 +1908,10 @@ impl Checker {
     /// Type of `snd p`: the Sigma's codomain with `fst p` substituted.
     /// Same two cases (and same deliberate omission) as `infer_fst`.
     fn infer_snd(&self, p: &Core, ctx: &Ctx) -> Result<Value, CheckError> {
-        if let Core::Pair(_, b) = p {
-            return self.infer(b, ctx);
+        if let Core::Pair(a, b) = p {
+            let ty = self.infer(b, ctx)?;
+            self.check_inferable(a, ctx)?;
+            return Ok(ty);
         }
         let pty = self.infer(p, ctx)?;
         let mut fuel = FUEL_LIMIT;
@@ -1991,6 +2024,7 @@ impl Checker {
     /// first contact. Re-encounters shrink `origin_len` (sound solution
     /// scope) and unify differing recorded types (one unknown, one type).
     fn ensure_meta(&self, id: u32, span: Span, ty: Option<Value>, origin_len: usize, ctx: &Ctx) -> Result<(), CheckError> {
+        let mut newly_typed: Option<(Value, Value)> = None;
         {
             let mut metas = self.metas.borrow_mut();
             while metas.len() <= id as usize {
@@ -2005,7 +2039,11 @@ impl Checker {
                         }
                         (None, Some(new)) => {
                             e.ty = Some(new.clone());
-                            return Ok(());
+                            if let Some(solved) = &e.assigned {
+                                newly_typed = Some((new.clone(), solved.clone()));
+                            } else {
+                                return Ok(());
+                            }
                         }
                         _ => return Ok(()),
                     }
@@ -2015,6 +2053,18 @@ impl Checker {
                     return Ok(());
                 }
             }
+        }
+        if let Some((new, solved)) = newly_typed {
+            if occurs_meta(id, &new) {
+                return Err(CheckError::new("hole `_` used at inconsistent types".to_string()));
+            }
+            let z = self.zonk_value(&solved)?;
+            let mut fuel_q = FUEL_LIMIT;
+            let core = crate::core::quote(ctx.len(), &z, &self.gvals, &mut fuel_q, 0)
+                .map_err(|e| CheckError::new(format!("hole solution cannot be re-checked: {e}")))?;
+            return self
+                .check(&core, &new, ctx)
+                .map_err(|_| CheckError::new("hole `_` used at inconsistent types".to_string()));
         }
         // Re-encounter with a second known type: the two must agree (one
         // unknown term, one type — differing demands are a real error).
@@ -2104,22 +2154,30 @@ impl Checker {
     fn unify_rigid(&self, a: &Value, b: &Value, ctx: &Ctx, level: usize) -> Result<UOut, CheckError> {
         match (a, b) {
             (Value::Pi { dom: d1, cod: c1, .. }, Value::Pi { dom: d2, cod: c2, .. }) => {
-                self.seq_unify(&[
+                let dom = self.seq_unify(&[
                     (d1.as_ref(), d2.as_ref()),
                 ], ctx, level)?;
+                if dom == UOut::Mismatch {
+                    return Ok(UOut::Mismatch);
+                }
                 let fresh = Value::Var(level);
                 let v1 = c1.apply(fresh.clone(), &self.gvals)?;
                 let v2 = c2.apply(fresh, &self.gvals)?;
-                self.seq_unify(&[(&v1, &v2)], ctx, level + 1)
+                let cod = self.seq_unify(&[(&v1, &v2)], ctx, level + 1)?;
+                Ok(combine_unify(dom, cod))
             }
             (Value::Sigma { dom: d1, cod: c1, .. }, Value::Sigma { dom: d2, cod: c2, .. }) => {
-                self.seq_unify(&[
+                let dom = self.seq_unify(&[
                     (d1.as_ref(), d2.as_ref()),
                 ], ctx, level)?;
+                if dom == UOut::Mismatch {
+                    return Ok(UOut::Mismatch);
+                }
                 let fresh = Value::Var(level);
                 let v1 = c1.apply(fresh.clone(), &self.gvals)?;
                 let v2 = c2.apply(fresh, &self.gvals)?;
-                self.seq_unify(&[(&v1, &v2)], ctx, level + 1)
+                let cod = self.seq_unify(&[(&v1, &v2)], ctx, level + 1)?;
+                Ok(combine_unify(dom, cod))
             }
             (Value::App(f1, a1), Value::App(f2, a2))
             | (Value::Pair(f1, a1), Value::Pair(f2, a2))
@@ -2255,7 +2313,8 @@ impl Checker {
         // context), the assignment cannot be validated here — postpone the
         // equation instead of assigning blindly (the drain retries; an
         // unassigned hole still fails the def at the unsolved sweep).
-        if let Some(ty) = self.metas.borrow().get(id as usize).and_then(|o| o.as_ref()).and_then(|e| e.ty.clone()) {
+        let ty = self.metas.borrow().get(id as usize).and_then(|o| o.as_ref()).and_then(|e| e.ty.clone());
+        if let Some(ty) = ty {
             let zty = self.zonk_value(&ty)?;
             if occurs_meta(id, &zty) {
                 return Ok(UOut::Mismatch);
@@ -2587,9 +2646,9 @@ impl Checker {
     fn check_hole(&self, id: u32, span: Span, expected: &Value, ctx: &Ctx) -> Result<(), CheckError> {
         // Assigned already (e.g. solved earlier, re-met through a
         // quote-then-infer roundtrip): the solution must fit here too.
-        if let Some(solved) = self.metas.borrow().get(id as usize).and_then(|o| o.as_ref()).and_then(|e| e.assigned.clone()) {
-            let z = self.zonk_value(&solved)?;
-            return self.unify(&z, expected, ctx, &Core::Hole { id, span });
+        let assigned = self.metas.borrow().get(id as usize).and_then(|o| o.as_ref()).is_some_and(|e| e.assigned.is_some());
+        if assigned {
+            return self.ensure_meta(id, span, Some(expected.clone()), ctx.len(), ctx);
         }
         let mut fuel = FUEL_LIMIT;
         let exp = whnf(expected, &self.gvals, &mut fuel)?;
@@ -2729,6 +2788,7 @@ impl Checker {
                 // (a failed comparison must leave no trace); assignments it
                 // made stay (they are verified solutions, like everywhere).
                 let ucons_snapshot = self.ucons.borrow().len();
+                let postponed_snapshot = self.postponed.borrow().len();
                 match self.expect_conv(&inferred, expected, ctx, val) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
@@ -2753,6 +2813,7 @@ impl Checker {
                                     && (!inferred_is_sort || !self.meta_leak_core(val)) =>
                             {
                                 self.ucons.borrow_mut().truncate(ucons_snapshot);
+                                self.postponed.borrow_mut().truncate(postponed_snapshot);
                                 let actual = self.infer_sort(val, ctx)?;
                                 return self.require_sort_le(&actual, &s).map_err(|_| {
                                     CheckError::new(format!(
@@ -2828,9 +2889,10 @@ impl Checker {
         // large one (contravariance demands `Type0 <= *`, which fails).
         // Anything undecided here (metas, non-Pi shapes) falls through to
         // unification below, so hole behavior is unchanged.
+        let ucons_snapshot = self.ucons.borrow().len();
         match self.subsumes(inferred, expected, ctx) {
             Ok(true) => return Ok(()),
-            Ok(false) => {}
+            Ok(false) => self.ucons.borrow_mut().truncate(ucons_snapshot),
             Err(e) => return Err(e),
         }
         // Unification (holes-aware): solves, defers, or mismatches. Plain
@@ -3804,6 +3866,13 @@ mod tests {
         // `fst f x` is `(fst f) x`, not `fst (f x)` (needs no annotation
         // since every part is neutral — lambdas as parts would, see below).
         ok("def t : (f:Void -> Void) -> (v:Void) -> Void = \\f v. fst (f, (absurd Void v)) (absurd Void v);");
+        // The ignored component is still checked: projections cannot hide
+        // ill-typed pair halves.
+        fails("def bad : Unit = fst ((), (() : Void));");
+        fails("def bad : Unit = snd (((() : Void)), ());");
+        // Nested pairs are still accepted: their components are inferable.
+        ok("def t : Unit = fst ((), ((), ()));");
+        ok("def t : Unit = snd ((((), ()), ()));");
     }
 
     #[test]
@@ -3891,6 +3960,9 @@ mod tests {
         fails("def bad : (v:Void) -> Void = \\v. w_rect Void (\\_. Void) (\\_. *) (\\a f ih. absurd Void a) (sup Void (\\_. Void) v (\\x. absurd (W Void (\\_. Void)) x));");
         // `W` needs small families (`*` itself never fits).
         fails("def bad : * = W * (\\_. *);");
+        // The W-spine level shortcut must not skip checking its function
+        // part: this reduces to `W Unit` while hiding `(() : Void)`.
+        fails("def bad : Type0 = ((\\x. W Unit) (() : Void)) (\\_. Unit);");
     }
 
     #[test]
@@ -3934,6 +4006,50 @@ mod tests {
             "induction into Unit must convert by Unit-eta:\n{}",
             checker.report()
         );
+    }
+
+    #[test]
+    fn assigned_hole_rechecks_against_expected_type() {
+        let c = Checker::new();
+        let ctx = Ctx::default();
+        c.ensure_meta(0, Span::empty(0), Some(Value::Unit), 0, &ctx).unwrap();
+        c.assign_meta(0, Value::Pt);
+        c.check_hole(0, Span::empty(0), &Value::Unit, &ctx).unwrap();
+        c.ensure_meta(1, Span::empty(0), Some(Value::Unit), 0, &ctx).unwrap();
+        c.assign_meta(1, Value::Pt);
+        assert!(c.check_hole(1, Span::empty(0), &Value::Void, &ctx).is_err());
+        c.ensure_meta(2, Span::empty(0), None, 0, &ctx).unwrap();
+        c.assign_meta(2, Value::Pt);
+        c.ensure_meta(2, Span::empty(0), Some(Value::Unit), 0, &ctx).unwrap();
+        c.ensure_meta(3, Span::empty(0), None, 0, &ctx).unwrap();
+        c.assign_meta(3, Value::Pt);
+        assert!(c.ensure_meta(3, Span::empty(0), Some(Value::Void), 0, &ctx).is_err());
+    }
+
+    #[test]
+    fn rigid_pi_domain_mismatch_not_masked_by_meta() {
+        // A meta in the codomain must not hide an incompatible domain.
+        let c = Checker::new();
+        let ctx = Ctx::default();
+        c.ensure_meta(
+            0,
+            Span::empty(0),
+            Some(Value::Sort(Sort::Type(Level::Const(0)))),
+            0,
+            &ctx,
+        )
+        .unwrap();
+        let pi1 = Value::Pi {
+            name: "_".to_string(),
+            dom: Box::new(Value::Unit),
+            cod: Closure::new(vec![], Core::Sort(Sort::Star)),
+        };
+        let pi2 = Value::Pi {
+            name: "_".to_string(),
+            dom: Box::new(Value::Void),
+            cod: Closure::new(vec![], Core::Hole { id: 0, span: Span::empty(0) }),
+        };
+        assert_eq!(c.unify_inner(&pi1, &pi2, &ctx, 0).unwrap(), UOut::Mismatch);
     }
 
     #[test]
@@ -4192,6 +4308,11 @@ mod tests {
         fails("def bad : (Unit or (let X : Void = () in Unit)) = inl ();");
         fails("def bad : (let X : Void = () in Unit) -> Unit = \\x. x;");
         fails("def bad : Quot (let X : Void = () in Unit) (\\_ _. Unit) = quot_mk ();");
+        // Type expressions are checked before evaluation, so reducible
+        // applications/projections cannot discard ill-typed arguments.
+        fails("def k : (A:*) -> A -> * = \\A x. A; def bad (v:Void) : k Unit (() : Void) = absurd Unit v;");
+        fails("def bad (v:Void) : fst (Void, (() : Void)) = absurd Void v;");
+        fails("def bad (v:Void) : match (inl () : Unit or Unit) return (\\_. *) { inl _ => Unit | inr _ => (() : Void) } = absurd Unit v;");
         ok("def good : ((let X : Unit = () in Unit) -> Unit) = \\x. x;");
         ok("def good : (Unit or (let X : Unit = () in Unit)) = inl ();");
     }
@@ -4330,7 +4451,7 @@ mod tests {
                def bad : (A:*) -> (f:A -> A) -> (x:A) -> path A (f x) x = \\A f x. id_path A x;");
         ok("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
             def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
-            def constPmct : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P ((\\_. v) P) -> P ((\\_. v) P)) -> path ((P:(T -> *)) -> P ((\\_. v) P) -> P ((\\_. v) P)) p (\\P x. x) = \\T v p. id_path ((P:(T -> *)) -> P ((\\_. v) P) -> P ((\\_. v) P)) p;");
+            def constPmct : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P (((\\Q. v) : ((T -> *) -> T)) P) -> P (((\\Q. v) : ((T -> *) -> T)) P)) -> path ((P:(T -> *)) -> P (((\\Q. v) : ((T -> *) -> T)) P) -> P (((\\Q. v) : ((T -> *) -> T)) P)) p (\\P x. x) = \\T v p. id_path ((P:(T -> *)) -> P (((\\Q. v) : ((T -> *) -> T)) P) -> P (((\\Q. v) : ((T -> *) -> T)) P)) p;");
         fails("def path : (T:*) -> (a:T) -> (b:T) -> * = \\T a b. (P:(T -> *)) -> (P a) -> (P b); \
                def id_path : (T:*) -> (v:T) -> path T v v = \\T v P h. h; \
                def large : (T:*) -> (v:T) -> (p:(P:(T -> Type)) -> P v -> P v) -> path ((P:(T -> Type)) -> P v -> P v) p (\\P x. x) = \\T v p. id_path ((P:(T -> Type)) -> P v -> P v) p;");
