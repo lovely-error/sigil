@@ -107,3 +107,37 @@ def wplus_comm_step : (m:WNat) -> (k:WNat) -> path WNat (wplus k m) (wplus m k) 
   = \m k ih. path_trans WNat (wplus (wsucc k) m) (wsucc (wplus k m)) (wplus m (wsucc k)) (id_path WNat (wsucc (wplus k m))) (path_trans WNat (wsucc (wplus k m)) (wsucc (wplus m k)) (wplus m (wsucc k)) (congr_succ (wplus k m) (wplus m k) ih) (path_symm WNat (wplus m (wsucc k)) (wsucc (wplus m k)) (wplus_succ_right m k)));
 def wplus_comm : (n:WNat) -> (m:WNat) -> path WNat (wplus n m) (wplus m n)
   = \n m. nat_ind (\k. path WNat (wplus k m) (wplus m k)) (wplus_comm_base m) (wplus_comm_step m) n;
+
+
+def Dec : (A:*) -> * = \A. A or (A -> Void);
+
+-- Large elimination: a type-valued function on WNat, via w_rect with motive (\_. *)
+def isZero : WNat -> * =
+  \w. w_rect Bool Bf (\_. *) (\a f ih. match a return (\_. *) { inl _ => Unit | inr _ => Void }) w;
+
+-- 1. disjointness
+def zero_ne_succ : (n:WNat) -> path WNat wzero (wsucc n) -> Void =
+  \n p. p isZero ();
+
+-- 2. injectivity, via a predecessor
+def wpred : WNat -> WNat =
+  \w. w_rect Bool Bf (\_. WNat) (\a f ih. match a return (\_. WNat) { inl _ => wzero | inr u => f () }) w;
+def succ_inj : (n:WNat) -> (m:WNat) -> path WNat (wsucc n) (wsucc m) -> path WNat n m =
+  \n m p. p (\x. path WNat n (wpred x)) (id_path WNat n);
+
+-- 3. the decision procedure, by nat_ind on m, then on n
+def decEq : (m:WNat) -> (n:WNat) -> Dec (path WNat m n) =
+  \m. nat_ind (\m2. (n:WNat) -> Dec (path WNat m2 n))
+    (\n. nat_ind (\n2. Dec (path WNat wzero n2))
+           (inl (id_path WNat wzero))
+           (\k ih. inr (zero_ne_succ k))
+           n)
+    (\m2 ih n. nat_ind (\n2. Dec (path WNat (wsucc m2) n2))
+           (inr (\p. zero_ne_succ m2 (path_symm WNat (wsucc m2) wzero p)))
+           (\k ih2. either_rect (path WNat m2 k) (path WNat m2 k -> Void)
+                      (\_. Dec (path WNat (wsucc m2) (wsucc k)))
+                      (\e. inl (congr_succ m2 k e))
+                      (\ne. inr (\h. ne (succ_inj m2 k h)))
+                      (ih k))
+           n)
+    m;
