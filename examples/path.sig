@@ -68,3 +68,19 @@ def pmct_eta_2 : (T:*) -> (a:T) -> (b:T) ->
           path_symm (P b) (p2 P x) (p1 P x)
             (path_subst (P a) (pmct_q1 T a b p1 P (p1 P x)) x h_a
               (\z. path (P b) (p2 P z) (p1 P x)) h_b)));
+
+
+-- Based path induction (Paulin-Mohring J):
+-- Given `d : C a (id_path T a)`, produces an element of `C b p` for any `b` and `p`.
+def path_J : (T:*) -> (a:T) ->
+  (C:(b:T) -> (p:path T a b) -> *) ->
+  (d:C a (id_path T a)) ->
+  (b:T) -> (p:path T a b) -> C b p =
+  \T a C d b p.
+    let M : (T -> *) = \x. (q:path T a x) -> C x q in
+    let base : M a =
+      \q. path_subst (path T a a) (id_path T a) q
+            (pmct_eta_2 T a a (id_path T a) q)
+            (\r. C a r)
+            d in
+    path_subst T a b p M base p;
