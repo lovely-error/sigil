@@ -13,11 +13,6 @@ metatheory yet.
 
 ## Quick start
 
-```sigil
-def id : (T : *) -> T -> T = \T x. x;
-def snd2 : (A : *) -> (B : A -> *) -> (p : (x : A) and B x) -> B (fst p) = \A B p. snd p;
-```
-
 ```sh
 sigil-neo check hello.sig   # type-check every def; exit 0 on success
 sigil-neo hello.sig         # same as check
