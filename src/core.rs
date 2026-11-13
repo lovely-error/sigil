@@ -122,17 +122,6 @@ pub enum Core {
     /// Soundness axiom (stuck-neutral primitive constant, like `Absurd`:
     /// `quot_sound A R a b h : path-enc (Quot A R) (mk a) (mk b)` — no iota).
     QuotSound,
-    /// Dependent case analysis `match e return P { inl x => b1 | inr y => b2 }`.
-    /// Branch bodies are core terms under one pattern binder each (names kept
-    /// for pretty-printing; de Bruijn handles scope).
-    Match {
-        scrut: Box<Core>,
-        motive: Box<Core>,
-        l_name: String,
-        l_body: Box<Core>,
-        r_name: String,
-        r_body: Box<Core>,
-    },
     /// One-element type (`Unit : *`).
     Unit,
     /// Its sole value `()`.
@@ -246,17 +235,6 @@ pub enum Value {
     /// Stuck soundness-axiom constant (never unfolds; applications neutral —
     /// there is no canonical `R`-proof shape to reduce against, like `Absurd`).
     QuotSound,
-    /// Stuck dependent match (iota fires in `eval`/`whnf` when the scrutinee
-    /// is canonical; branch bodies stay closures so no environment is ever
-    /// missing — unlike W's quoted IH).
-    Match {
-        scrut: Box<Value>,
-        mot: Box<Value>,
-        l_name: String,
-        l_body: Closure,
-        r_name: String,
-        r_body: Closure,
-    },
     /// One-element type value.
     Unit,
     /// Its sole value (canonical; no reduction).
@@ -388,32 +366,6 @@ fn eval_in(term: &Core, env: &Env, globals: &GlobalVals, fuel: &mut u32, depth: 
         Core::W => Ok(Value::W),
         Core::Sup => Ok(Value::Sup),
         Core::WRect => Ok(Value::WRect),
-        Core::Match { scrut, motive, l_name, l_body, r_name, r_body } => {
-            let sv = eval_in(scrut, env, globals, fuel, depth - 1)?;
-            let mv = eval_in(motive, env, globals, fuel, depth - 1)?;
-            // Iota eagerly when canonical; otherwise capture branch closures
-            // (their bodies stay lazy, so no environment is ever missing).
-            match sv {
-                Value::Inl(a) => {
-                    let mut env2 = env.clone();
-                    env2.push(*a);
-                    eval_in(l_body, &env2, globals, fuel, depth - 1)
-                }
-                Value::Inr(b) => {
-                    let mut env2 = env.clone();
-                    env2.push(*b);
-                    eval_in(r_body, &env2, globals, fuel, depth - 1)
-                }
-                _ => Ok(Value::Match {
-                    scrut: Box::new(sv),
-                    mot: Box::new(mv),
-                    l_name: l_name.clone(),
-                    l_body: Closure::new(env.clone(), (**l_body).clone()),
-                    r_name: r_name.clone(),
-                    r_body: Closure::new(env.clone(), (**r_body).clone()),
-                }),
-            }
-        }
         Core::Either(a, b) => {
             Ok(Value::Either(
                 Box::new(eval_in(a, env, globals, fuel, depth - 1)?),
@@ -886,34 +838,6 @@ pub fn whnf(value: &Value, globals: &GlobalVals, fuel: &mut u32) -> Result<Value
                     _ => return Ok(Value::Snd(p)),
                 }
             }
-            // Iota for dependent match (completeness: a scrutinee that only
-            // becomes canonical after unfolding — e.g. a global alias — still
-            // reduces, using the stored branch closures, so no environment
-            // is ever missing).
-            Value::Match { scrut, mot, l_name, l_body, r_name, r_body } => {
-                match whnf(&scrut, globals, fuel)? {
-                    Value::Inl(a) => {
-                        let mut env2 = l_body.env.clone();
-                        env2.push(*a);
-                        cur = eval_in(&l_body.term, &env2, globals, fuel, EVAL_DEPTH_LIMIT)?;
-                    }
-                    Value::Inr(b) => {
-                        let mut env2 = r_body.env.clone();
-                        env2.push(*b);
-                        cur = eval_in(&r_body.term, &env2, globals, fuel, EVAL_DEPTH_LIMIT)?;
-                    }
-                    sw => {
-                        return Ok(Value::Match {
-                            scrut: Box::new(sw),
-                            mot,
-                            l_name,
-                            l_body,
-                            r_name,
-                            r_body,
-                        });
-                    }
-                }
-            }
             _ => return Ok(cur),
         }
     }
@@ -1002,24 +926,6 @@ pub fn quote(level: usize, value: &Value, globals: &GlobalVals, fuel: &mut u32, 
         Value::Snd(p) => {
             let pc = quote(level, &p, globals, fuel, depth + 1)?;
             Ok(Core::Snd(Box::new(pc)))
-        }
-        Value::Match { scrut, mot, l_name, l_body, r_name, r_body } => {
-            let sc = quote(level, &scrut, globals, fuel, depth + 1)?;
-            let mc = quote(level, &mot, globals, fuel, depth + 1)?;
-            // Branch closures quote like lambda bodies (fresh var, extend).
-            let fresh = Value::Var(level);
-            let lv = l_body.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
-            let lc = quote(level + 1, &lv, globals, fuel, depth + 1)?;
-            let rv = r_body.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
-            let rc = quote(level + 1, &rv, globals, fuel, depth + 1)?;
-            Ok(Core::Match {
-                scrut: Box::new(sc),
-                motive: Box::new(mc),
-                l_name: l_name.clone(),
-                l_body: Box::new(lc),
-                r_name: r_name.clone(),
-                r_body: Box::new(rc),
-            })
         }
         Value::Lam { name, body } => {
             let fresh = Value::Var(level);
@@ -1111,10 +1017,6 @@ fn value_type(
                 _ => Ok(None),
             }
         }
-        Value::Match { scrut, mot, .. } => Ok(Some(Value::App(
-            Box::new(mot.as_ref().clone()),
-            Box::new(scrut.as_ref().clone()),
-        ))),
         _ => Ok(None),
     }
 }
@@ -1208,7 +1110,6 @@ fn may_be_pmct(v: &Value) -> bool {
             | Value::App(_, _)
             | Value::Fst(_)
             | Value::Snd(_)
-            | Value::Match { .. }
     )
 }
 
@@ -1383,7 +1284,6 @@ pub fn conv(
                 Value::Var(_)
                     | Value::Global(_, _)
                     | Value::App(_, _)
-                    | Value::Match { .. }
                     | Value::Fst(_)
                     | Value::Snd(_)
                     | Value::Meta { .. }
@@ -1402,7 +1302,6 @@ pub fn conv(
                 Value::Var(_)
                     | Value::Global(_, _)
                     | Value::App(_, _)
-                    | Value::Match { .. }
                     | Value::Fst(_)
                     | Value::Snd(_)
                     | Value::Meta { .. }
@@ -1445,31 +1344,6 @@ pub fn conv(
         (Value::Snd(p1), Value::Snd(p2)) => {
             conv(level, &p1, &p2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)
         }
-        (Value::Match { scrut: s1, mot: m1, l_body: l1, r_body: r1, .. },
-         Value::Match { scrut: s2, mot: m2, l_body: l2, r_body: r2, .. }) => {
-            if !conv(level, &s1, &s2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
-                return Ok(false);
-            }
-            if !conv(level, &m1, &m2, var_types, globals, fuel, depth + 1, ucs, allow_pmct)? {
-                return Ok(false);
-            }
-            // Branch bodies compare like lambda bodies (shared fresh var).
-            let fresh = Value::Var(level);
-            let lv1 = l1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
-            let lv2 = l2.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
-            var_types.push(None);
-            let lr = conv(level + 1, &lv1, &lv2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
-            var_types.pop();
-            if !lr? {
-                return Ok(false);
-            }
-            let rv1 = r1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
-            let rv2 = r2.apply_in(fresh, globals, fuel, EVAL_DEPTH_LIMIT)?;
-            var_types.push(None);
-            let rr = conv(level + 1, &rv1, &rv2, var_types, globals, fuel, depth + 1, ucs, allow_pmct);
-            var_types.pop();
-            rr
-        }
         (Value::Lam { body: b1, .. }, Value::Lam { body: b2, .. }) => {
             let fresh = Value::Var(level);
             let v1 = b1.apply_in(fresh.clone(), globals, fuel, EVAL_DEPTH_LIMIT)?;
@@ -1503,7 +1377,6 @@ pub fn conv(
                 Value::Var(_)
                 | Value::Global(_, _)
                 | Value::App(_, _)
-                | Value::Match { .. }
                 | Value::Fst(_)
                 | Value::Snd(_)
                 | Value::Meta { .. } => Ok(true),
@@ -1639,14 +1512,6 @@ pub fn subst_level_core(c: &Core, m: &HashMap<u32, Level>) -> Core {
             Box::new(subst_level_core(r, m)),
         ),
         Core::QuotMk(a) => Core::QuotMk(Box::new(subst_level_core(a, m))),
-        Core::Match { scrut, motive, l_name, l_body, r_name, r_body } => Core::Match {
-            scrut: Box::new(subst_level_core(scrut, m)),
-            motive: Box::new(subst_level_core(motive, m)),
-            l_name: l_name.clone(),
-            l_body: Box::new(subst_level_core(l_body, m)),
-            r_name: r_name.clone(),
-            r_body: Box::new(subst_level_core(r_body, m)),
-        },
         Core::Lam { name, body } => Core::Lam {
             name: name.clone(),
             body: Box::new(subst_level_core(body, m)),
@@ -1717,14 +1582,6 @@ pub fn subst_level_value(v: &Value, m: &HashMap<u32, Level>) -> Value {
             Box::new(subst_level_value(r, m)),
         ),
         Value::QuotMk(a) => Value::QuotMk(Box::new(subst_level_value(a, m))),
-        Value::Match { scrut, mot, l_name, l_body, r_name, r_body } => Value::Match {
-            scrut: Box::new(subst_level_value(scrut, m)),
-            mot: Box::new(subst_level_value(mot, m)),
-            l_name: l_name.clone(),
-            l_body: subst_level_closure(l_body, m),
-            r_name: r_name.clone(),
-            r_body: subst_level_closure(r_body, m),
-        },
         Value::Lam { name, body } => Value::Lam {
             name: name.clone(),
             body: subst_level_closure(body, m),
@@ -1793,15 +1650,6 @@ pub fn level_vars_value(v: &Value, out: &mut Vec<u32>) {
             level_vars_value(r, out);
         }
         Value::QuotMk(a) => level_vars_value(a, out),
-        Value::Match { scrut, mot, l_body, r_body, .. } => {
-            level_vars_value(scrut, out);
-            level_vars_value(mot, out);
-            for e in l_body.env.iter().chain(r_body.env.iter()) {
-                level_vars_value(e, out);
-            }
-            level_vars_core(&l_body.term, out);
-            level_vars_core(&r_body.term, out);
-        }
         Value::Lam { body, .. } => {
             for e in &body.env {
                 level_vars_value(e, out);
@@ -1850,12 +1698,6 @@ pub fn level_vars_core(c: &Core, out: &mut Vec<u32>) {
         Core::Quotient(a, r) => {
             level_vars_core(a, out);
             level_vars_core(r, out);
-        }
-        Core::Match { scrut, motive, l_body, r_body, .. } => {
-            level_vars_core(scrut, out);
-            level_vars_core(motive, out);
-            level_vars_core(l_body, out);
-            level_vars_core(r_body, out);
         }
         Core::Let { ann, val, body, .. } => {
             if let Some(a) = ann {
@@ -2010,27 +1852,6 @@ fn pretty_core_with(term: &Core, names: &mut Vec<String>, gnames: &[String]) -> 
         }
         Core::Snd(p) => {
             format!("(snd {})", pretty_core_with(p, names, gnames))
-        }
-        Core::Match { scrut, motive, l_name, l_body, r_name, r_body } => {
-            let sc_s = pretty_core_with(scrut, names, gnames);
-            let mo_s = pretty_core_with(motive, names, gnames);
-            let dl = if l_name == "_" || l_name.is_empty() {
-                "_".to_string()
-            } else {
-                freshen(l_name, names)
-            };
-            names.push(dl.clone());
-            let bl = pretty_core_with(l_body, names, gnames);
-            names.pop();
-            let dr = if r_name == "_" || r_name.is_empty() {
-                "_".to_string()
-            } else {
-                freshen(r_name, names)
-            };
-            names.push(dr.clone());
-            let br = pretty_core_with(r_body, names, gnames);
-            names.pop();
-            format!("(match {sc_s} return {mo_s} {{ inl {dl} => {bl} | inr {dr} => {br} }})")
         }
         Core::App(f, a) => {
             format!("({} {})", pretty_core_with(f, names, gnames), pretty_core_with(a, names, gnames))
@@ -2362,29 +2183,6 @@ mod tests {
             "rebuilt target must stay free, got {:?}",
             args[0]
         );
-    }
-
-    #[test]
-    fn match_iota_and_stuck() {
-        // `match (inl v) ...` reduces to the left branch (iota); a neutral
-        // scrutinee stays stuck with branch closures stored.
-        let globals = GlobalVals::new();
-        let empty: Env = Vec::new();
-        let mk_match = |scrut: Core| Core::Match {
-            scrut: Box::new(scrut),
-            motive: Box::new(Core::Sort(Sort::Star)),
-            l_name: "a".to_string(),
-            l_body: Box::new(Core::Pt),
-            r_name: "b".to_string(),
-            r_body: Box::new(Core::Void),
-        };
-        let hit = mk_match(Core::Inl(Box::new(Core::Pt)));
-        let v = eval(&hit, &empty, &globals).unwrap();
-        assert!(matches!(v, Value::Pt));
-        let stuck = mk_match(Core::Bound(0));
-        let env: Env = vec![Value::Var(0)];
-        let w = eval(&stuck, &env, &globals).unwrap();
-        assert!(matches!(w, Value::Match { .. }));
     }
 
     #[test]

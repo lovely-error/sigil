@@ -15,13 +15,8 @@
 //! app_chain := simple+
 //! simple  := var | "_" | sort | void | absurd | fst simple | snd simple
 //!          | sig_rect | inl simple | inr simple | either_rect
-//!          | Unit | unit_rect | "()" | W | sup | w_rect | match_expr
+//!          | Unit | unit_rect | "()" | W | sup | w_rect
 //!          | lambda | paren | tuple
-//! match_expr := "match" expr "return" expr "{"
-//!                 ("inl" binder "=>" expr "|" "inr" binder "=>" expr
-//!                 |"inr" binder "=>" expr "|" "inl" binder "=>" expr) "}"
-//!          (exactly one `inl` and one `inr` clause; binders are idents or `_`;
-//!           no nesting — deferred with general patterns)
 //! lambda  := "\" name* "." expr | "fun" name* "=>" expr
 //! paren   := "(" expr ")" | "(" expr ":" expr ")"
 //! tuple   := "(" expr "," expr ")"                 // binary only
@@ -112,17 +107,6 @@ pub enum SExpr {
     QuotInd { span: Span },
     /// Soundness axiom `quot_sound` (primitive constant).
     QuotSound { span: Span },
-    /// Dependent case analysis `match e return P { inl x => b1 | inr y => b2 }`
-    /// (exactly one clause per side; refinable, see `check.rs`).
-    Match {
-        scrut: Box<SExpr>,
-        motive: Box<SExpr>,
-        l_name: String,
-        l_body: Box<SExpr>,
-        r_name: String,
-        r_body: Box<SExpr>,
-        span: Span,
-    },
     Lam { params: Vec<(String, Span)>, body: Box<SExpr>, span: Span },
     App { fun: Box<SExpr>, arg: Box<SExpr>, span: Span },
     Let { name: String, #[allow(dead_code)] name_span: Span, ann: Option<Box<SExpr>>, val: Box<SExpr>, body: Box<SExpr>, span: Span },
@@ -140,7 +124,7 @@ impl SExpr {
             | SExpr::Sigma { span, .. } | SExpr::And { span, .. } | SExpr::Tuple { span, .. }
             | SExpr::Fst { span, .. } | SExpr::Snd { span, .. } | SExpr::SigRect { span }
             | SExpr::Or { span, .. } | SExpr::Inl { span, .. } | SExpr::Inr { span, .. }
-            | SExpr::EitherRect { span } | SExpr::Match { span, .. }
+            | SExpr::EitherRect { span }
             | SExpr::Quotient { span, .. } | SExpr::QuotMk { span, .. }
             | SExpr::QuotLift { span } | SExpr::QuotInd { span } | SExpr::QuotSound { span } => *span,
             SExpr::Lam { span, .. }
@@ -635,7 +619,6 @@ impl<'a> Parser<'a> {
                 self.next();
                 Ok(SExpr::QuotSound { span: t.span })
             }
-            Some(t) if matches!(t.kind, TokKind::Match) => self.parse_match(d + 1),
             Some(t) if matches!(t.kind, TokKind::Fst | TokKind::Snd) => {
                 // Projection of one `simple`: `fst f x` is `(fst f) x`.
                 let is_fst = matches!(t.kind, TokKind::Fst);
@@ -660,94 +643,6 @@ impl<'a> Parser<'a> {
                 msg: "expected an expression, found end of input".to_string(),
             }),
         }
-    }
-
-    /// `match e return P { inl x => b1 | inr y => b2 }` (either order).
-    /// Exactly one `inl` and one `inr` clause, each binding one ident (or
-    /// `_`); anything else is a parse error (no nesting, no wildcards —
-    /// deferred with general patterns). Coverage is therefore syntactic.
-    fn parse_match(&mut self, d: u32) -> Result<SExpr, ParseError> {
-        let head = self.next().expect("checked");
-        let start = head.span.start;
-        let scrut = self.parse_expr(d + 1)?;
-        self.expect(&TokKind::Return, "'return' with motive in match")?;
-        let motive = self.parse_expr(d + 1)?;
-        self.expect(&TokKind::LBrace, "'{' with match clauses")?;
-        // First clause.
-        let (first_left, first_name, first_body) = self.parse_match_clause(d + 1)?;
-        self.expect(&TokKind::Pipe, "'|' between match clauses")?;
-        // Second clause.
-        let (second_left, second_name, second_body) = self.parse_match_clause(d + 1)?;
-        self.expect(&TokKind::RBrace, "'}' after match clauses")?;
-        if first_left == second_left {
-            let which = if first_left { "inl" } else { "inr" };
-            return Err(ParseError {
-                span: Span::new(start, second_body.span().end),
-                msg: format!(
-                    "match on sums needs exactly one `inl` and one `inr` clause (two `{which}` given)"
-                ),
-            });
-        }
-        let end = second_body.span().end;
-        let span = Span::new(start, end);
-        // Normalize order: left/inl first regardless of surface order.
-        let ((l_name, l_body), (r_name, r_body)) = if first_left {
-            ((first_name, first_body), (second_name, second_body))
-        } else {
-            ((second_name, second_body), (first_name, first_body))
-        };
-        Ok(SExpr::Match {
-            scrut: Box::new(scrut),
-            motive: Box::new(motive),
-            l_name,
-            l_body: Box::new(l_body),
-            r_name,
-            r_body: Box::new(r_body),
-            span,
-        })
-    }
-
-    /// One match clause: `inl x => body` or `inr y => body`. Returns
-    /// (is_left, binder_name, body).
-    fn parse_match_clause(&mut self, d: u32) -> Result<(bool, String, SExpr), ParseError> {
-        let tok = match self.next() {
-            Some(t) if matches!(t.kind, TokKind::Inl) => (true, t),
-            Some(t) if matches!(t.kind, TokKind::Inr) => (false, t),
-            Some(t) => {
-                return Err(ParseError {
-                    span: t.span,
-                    msg: format!(
-                        "expected `inl <name> => ...` or `inr <name> => ...` in match (found '{}')",
-                        t.text
-                    ),
-                });
-            }
-            None => {
-                return Err(ParseError {
-                    span: self.eof_span(),
-                    msg: "expected match clause, found end of input".to_string(),
-                });
-            }
-        };
-        let (is_left, _head) = tok;
-        let binder = match self.next() {
-            Some(t) if matches!(t.kind, TokKind::Ident | TokKind::Underscore) => t.text.to_string(),
-            Some(t) => {
-                return Err(ParseError {
-                    span: t.span,
-                    msg: format!("expected a binder name after `inl`/`inr`, found '{}'", t.text),
-                });
-            }
-            None => {
-                return Err(ParseError {
-                    span: self.eof_span(),
-                    msg: "expected a binder name after `inl`/`inr`, found end of input".to_string(),
-                });
-            }
-        };
-        self.expect(&TokKind::FatArrow, "'=>' after match pattern binder")?;
-        let body = self.parse_expr(d + 1)?;
-        Ok((is_left, binder, body))
     }
 
     fn parse_lambda(&mut self, d: u32) -> Result<SExpr, ParseError> {
@@ -1154,34 +1049,6 @@ mod tests {
         assert!(parse_program("def quot_ind : * = *;").is_err());
         assert!(parse_program("def quot_sound : * = *;").is_err());
         assert!(parse_expr("\\Quot. Quot").is_err());
-    }
-    #[test]
-    fn match_parses() {
-        let e = pe("match e return P { inl x => x | inr y => y }");
-        assert!(matches!(e, SExpr::Match { .. }));
-        // Either clause order accepted, normalized left-first.
-        let e2 = pe("match e return P { inr y => y | inl x => x }");
-        if let SExpr::Match { l_name, r_name, .. } = e2 {
-            assert_eq!((l_name.as_str(), r_name.as_str()), ("x", "y"));
-        } else {
-            panic!("expected match");
-        }
-        // `_` binders allowed.
-        assert!(matches!(pe("match e return P { inl _ => e | inr _ => e }"), SExpr::Match { .. }));
-    }
-
-    #[test]
-    fn match_rejects_bad_shapes() {
-        // Missing a side.
-        assert!(parse_expr("match e return P { inl x => x }").is_err());
-        // Duplicated side.
-        assert!(parse_expr("match e return P { inl x => x | inl y => y }").is_err());
-        // Non-constructor head.
-        assert!(parse_expr("match e return P { x => x | inr y => y }").is_err());
-        // Missing binder.
-        assert!(parse_expr("match e return P { inl => e | inr y => y }").is_err());
-        // `match` itself is reserved.
-        assert!(parse_program("def match : * = *;").is_err());
     }
 
     #[test]

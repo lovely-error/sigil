@@ -166,7 +166,7 @@
 //! `infer` call, no retained constraints).
 use crate::core::{pretty_core, pretty_value, conv, eval, whnf, subst_level_value, level_vars_value, level_vars_constraint, Closure, Core, Env, EvalError, GlobalDef, GlobalVals, Sort, Value, FUEL_LIMIT, DEPTH_LIMIT};
 use crate::levels::{subst_level_constraint, Constraint, Level, Rel, check_satisfiable, fresh_level_var};
-use crate::subst::{subst_val, contains_meta, occurs_meta, free_levels_value};
+use crate::subst::{contains_meta, occurs_meta, free_levels_value};
 use crate::lexer::{Span, line_col};
 use crate::parser::{SDecl, SExpr};
 use std::cell::{Cell, RefCell};
@@ -366,37 +366,6 @@ fn scope_expr(s: &mut Scope<'_>, e: &SExpr) -> Result<Core, CheckError> {
         SExpr::Fst { arg, .. } => Ok(Core::Fst(Box::new(scope_expr(s, arg)?))),
         SExpr::Snd { arg, .. } => Ok(Core::Snd(Box::new(scope_expr(s, arg)?))),
         SExpr::SigRect { .. } => Ok(Core::SigRect),
-        SExpr::Match { scrut, motive, l_name, l_body, r_name, r_body, .. } => {
-            // Branch bodies scope with their pattern binder pushed (shadowing
-            // allowed, inner wins — same as lambda clauses). Exhaustiveness
-            // was enforced syntactically (exactly inl+inr).
-            let scrut_c = scope_expr(s, scrut)?;
-            let motive_c = scope_expr(s, motive)?;
-            let internal_l = if l_name == "_" {
-                fresh_wild(&mut s.wild_counter)
-            } else {
-                l_name.clone()
-            };
-            s.locals.push(internal_l.clone());
-            let l_body_c = scope_expr(s, l_body);
-            s.locals.pop();
-            let internal_r = if r_name == "_" {
-                fresh_wild(&mut s.wild_counter)
-            } else {
-                r_name.clone()
-            };
-            s.locals.push(internal_r.clone());
-            let r_body_c = scope_expr(s, r_body);
-            s.locals.pop();
-            Ok(Core::Match {
-                scrut: Box::new(scrut_c),
-                motive: Box::new(motive_c),
-                l_name: display_name(&internal_l),
-                l_body: Box::new(l_body_c?),
-                r_name: display_name(&internal_r),
-                r_body: Box::new(r_body_c?),
-            })
-        }
         SExpr::Or { dom, cod, .. } => {
             Ok(Core::Either(
                 Box::new(scope_expr(s, dom)?),
@@ -1277,7 +1246,7 @@ impl Checker {
                 self.infer(ty, ctx)?;
                 eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from)
             }
-            Core::App(_, _) | Core::Match { .. } => {
+            Core::App(_, _) => {
                 self.infer(ty, ctx)?;
                 eval(ty, &ctx.values, &self.gvals).map_err(CheckError::from)
             }
@@ -1348,7 +1317,7 @@ impl Checker {
                 Ok(self.predicative_max(&i, &j))
             }
             Value::Var(_) | Value::Global(_, _) | Value::App(_, _)
-            | Value::Match { .. } | Value::Meta { .. } => {
+            | Value::Meta { .. } => {
                 // Neutral type: quote back to core and infer; its type must
                 // be a sort (lets in types work: `eval` unfolded them above).
                 // (A stuck `Match` in type position lands here too: quoted
@@ -1658,9 +1627,6 @@ impl Checker {
             ))),
             Core::Fst(p) => self.infer_fst(p, ctx),
             Core::Snd(p) => self.infer_snd(p, ctx),
-            Core::Match { scrut, motive, l_name: _, l_body, r_name: _, r_body, .. } => {
-                self.infer_match(scrut, motive, l_body, r_body, ctx)
-            }
             Core::Lam { .. } => Err(CheckError::new(format!(
                 "cannot infer type of {} (lambda needs an annotation)",
                 pretty_core(term, &self.gnames),
@@ -1745,122 +1711,6 @@ impl Checker {
         // Same as `infer` but the context is already extended. Since `infer`
         // takes `ctx` explicitly, this is just an alias for clarity.
         self.infer(term, ctx)
-    }
-
-    /// Infer the type of a dependent `match`: the motive applied to the
-    /// scrutinee. Branches are checked against the motive applied to the
-    /// constructor patterns; when the scrutinee is a *variable*, the branch
-    /// contexts are additionally refined by substituting the pattern
-    /// (first-order and total — see `subst.rs`), so hypotheses mentioning
-    /// the scrutinee follow the split. Non-variable scrutinees elaborate
-    /// plainly (motive + branches, like the eliminator — sound, just with
-    /// no refinement to give).
-    fn infer_match(
-        &self,
-        scrut: &Core,
-        motive: &Core,
-        l_body: &Core,
-        r_body: &Core,
-        ctx: &Ctx,
-    ) -> Result<Value, CheckError> {
-        // Scrutinee type must unfold to a sum (open scrutinees welcome —
-        // stuck is fine; only non-sums are rejected).
-        let sty = self.infer(scrut, ctx)?;
-        let mut fuel = FUEL_LIMIT;
-        let (dom_a, dom_b) = match whnf(&sty, &self.gvals, &mut fuel)? {
-            Value::Either(a, b) => ((*a).clone(), (*b).clone()),
-            other => {
-                return Err(CheckError::new(format!(
-                    "match scrutinee {} has non-sum type {}",
-                    pretty_core(scrut, &self.gnames),
-                    pretty_value(&other, ctx.len(), &self.gvals, &self.gnames),
-                )));
-            }
-        };
-        // Motive must be a family over the sum at hand, into any level
-        // (motives are level-general; formation computes the max).
-        let sum_v = Value::Either(Box::new(dom_a.clone()), Box::new(dom_b.clone()));
-        let mot_pi = Value::Pi {
-            name: "_".to_string(),
-            dom: Box::new(sum_v),
-            cod: Closure::new(ctx.values.clone(), fresh_sort()),
-        };
-        self.check(motive, &mot_pi, ctx)?;
-        // Scrutinee level, if it is a plain variable (refinement needs a
-        // variable to substitute; anything else elaborates plainly).
-        let scrut_lvl: Option<usize> = match scrut {
-            Core::Bound(ix) => {
-                if *ix >= ctx.len() {
-                    return Err(CheckError::new(format!("stuck de Bruijn index {ix}")));
-                }
-                Some(ctx.len() - 1 - ix)
-            }
-            _ => None,
-        };
-        // Left branch against `P (inl a)`, right against `P (inr b)`.
-        self.check_match_branch(scrut_lvl, true, &dom_a, l_body, motive, ctx)?;
-        self.check_match_branch(scrut_lvl, false, &dom_b, r_body, motive, ctx)?;
-        // Result: motive applied to the scrutinee (beta-reduces itself when
-        // the motive is a lambda; stuck-neutral otherwise — both fine).
-        eval(
-            &Core::app(motive.clone(), scrut.clone()),
-            &ctx.values,
-            &self.gvals,
-        )
-        .map_err(CheckError::from)
-    }
-
-    /// Check one match branch in a possibly-refined context: clone the
-    /// context, substitute the constructor pattern for the scrutinee level
-    /// (if any — see `infer_match`), push the pattern-binder entry, and
-    /// check the body against the motive applied to the pattern.
-    fn check_match_branch(
-        &self,
-        scrut_lvl: Option<usize>,
-        is_left: bool,
-        part_ty: &Value,
-        body: &Core,
-        motive: &Core,
-        ctx: &Ctx,
-    ) -> Result<(), CheckError> {
-        let mut ext = ctx.clone();
-        // Fresh pattern level on top (append-only: existing levels stable).
-        let lf = ext.len();
-        // Refinement first (needs `lf` known, entries still unextended).
-        if let Some(lx) = scrut_lvl {
-            for ty in ext.types.iter_mut() {
-                *ty = subst_val(ty, lx, lf, is_left);
-            }
-            for vv in ext.values.iter_mut() {
-                *vv = subst_val(vv, lx, lf, is_left);
-            }
-        }
-        // Injection-shaped scrutinee value (what the scrutinee refined to);
-        // the pattern *binder* below denotes the payload itself.
-        let pat_val = if is_left {
-            Value::Inl(Box::new(Value::Var(lf)))
-        } else {
-            Value::Inr(Box::new(Value::Var(lf)))
-        };
-        // The binder itself denotes the *payload* (neutral `Var(lf)`); the
-        // injection-shaped `pat_val` is what the *scrutinee* refined to — it
-        // belongs in substituted entries and the goal below, not here.
-        // (Pushing the injection as the binder's value would double-wrap:
-        // `f a` would infer through `P (inl (inl a))` instead of `P (inl a)`.)
-        ext.push(part_ty.clone(), Value::Var(lf));
-        // Goal: motive applied to the pattern. The motive core is scoped for
-        // the UNEXTENDED context, so evaluate it there and apply the value
-        // to the pattern: evaluating `P (inl a)`-core in the extended env
-        // would misread `P`'s indices (off-by-push — every motive variable
-        // would point one entry too deep). Closure application carries the
-        // captured environment, so it stays correct; neutral motives apply
-        // structurally (no indices involved either way).
-        let mot_v = eval(motive, &ctx.values, &self.gvals)?;
-        let goal = match mot_v {
-            Value::Lam { body, .. } => body.apply(pat_val, &self.gvals)?,
-            neutral => Value::App(Box::new(neutral), Box::new(pat_val)),
-        };
-        self.check(body, &goal, &ext)
     }
 
     /// Validate a term that is not needed for the result type of a
@@ -2214,7 +2064,6 @@ impl Checker {
                 Value::Var(_)
                 | Value::Global(_, _)
                 | Value::App(_, _)
-                | Value::Match { .. }
                 | Value::Fst(_)
                 | Value::Snd(_)
                 | Value::Meta { .. } => Ok(UOut::Eq),
@@ -2412,14 +2261,6 @@ impl Checker {
                 Box::new(self.zonk_value_in(r, depth + 1)?),
             )),
             Value::QuotMk(a) => Ok(Value::QuotMk(Box::new(self.zonk_value_in(a, depth + 1)?))),
-            Value::Match { scrut, mot, l_name, l_body, r_name, r_body } => Ok(Value::Match {
-                scrut: Box::new(self.zonk_value_in(scrut, depth + 1)?),
-                mot: Box::new(self.zonk_value_in(mot, depth + 1)?),
-                l_name: l_name.clone(),
-                l_body: self.zonk_closure(l_body, depth + 1)?,
-                r_name: r_name.clone(),
-                r_body: self.zonk_closure(r_body, depth + 1)?,
-            }),
             _ => Ok(v.clone()),
         }
     }
@@ -2474,12 +2315,6 @@ impl Checker {
             Value::Inl(a) | Value::Inr(a) | Value::Fst(a) | Value::Snd(a) | Value::QuotMk(a) => {
                 self.meta_leak(a)
             }
-            Value::Match { scrut, mot, l_body, r_body, .. } => {
-                self.meta_leak(scrut)
-                    || self.meta_leak(mot)
-                    || self.meta_leak_closure(l_body)
-                    || self.meta_leak_closure(r_body)
-            }
         }
     }
 
@@ -2526,12 +2361,6 @@ impl Checker {
             | Core::Snd(a)
             | Core::QuotMk(a)
             | Core::Lam { body: a, .. } => self.meta_leak_core(a),
-            Core::Match { scrut, motive, l_body, r_body, .. } => {
-                self.meta_leak_core(scrut)
-                    || self.meta_leak_core(motive)
-                    || self.meta_leak_core(l_body)
-                    || self.meta_leak_core(r_body)
-            }
             Core::Let { ann, val, body, .. } => {
                 ann.as_ref().is_some_and(|a| self.meta_leak_core(a))
                     || self.meta_leak_core(val)
@@ -2777,8 +2606,7 @@ impl Checker {
         // neutrals; ambiguous intros like pairs/sums keep their dispatch.)
         match val {
             Core::App(_, _) | Core::Bound(_) | Core::Global(_, _)
-            | Core::Fst(_) | Core::Snd(_) | Core::EitherRect | Core::Pt
-            | Core::Match { .. } => {
+            | Core::Fst(_) | Core::Snd(_) | Core::EitherRect | Core::Pt => {
                 let inferred = self.infer(val, ctx)?;
                 // Formation positions (`expected` is a sort) care about the
                 // denotation, not the inferred type — but the cheap decision
@@ -3744,7 +3572,7 @@ mod tests {
     fn user_case_analysis_reused_at_two_levels() {
         // A user-written eliminator over ambiguous levels, used on `*`-data
         // with a `*`-motive AND on `Type0`-data with a `Type1`-motive.
-        ok("def mycase : (A:Type) -> (B:Type) -> (P:((A or B) -> Type)) -> (f:(a:A) -> P (inl a)) -> (g:(b:B) -> P (inr b)) -> (e:A or B) -> P e = \\A B P f g e. match e return P { inl a => f a | inr b => g b }; \
+        ok("def mycase : (A:Type) -> (B:Type) -> (P:((A or B) -> Type)) -> (f:(a:A) -> P (inl a)) -> (g:(b:B) -> P (inr b)) -> (e:A or B) -> P e = \\A B P f g e. either_rect A B (\\x. P x) (\\a. f a) (\\b. g b) e; \
             def u1 : Unit = mycase Unit Unit (\\_. Unit) (\\_. ()) (\\_. ()) (inl () : Unit or Unit); \
             def u2 : Type1 = mycase Type0 Type0 (\\_. Type1) (\\_. Type0) (\\_. Type0) (inl Unit : Type0 or Type0);");
     }
@@ -3983,9 +3811,13 @@ mod tests {
         // but a BARE `z` cannot cross the `inl`-branch (the child functions
         // differ — transport, now derived, is genuinely required). So this
         // shape must keep failing.
-        ok("def Bf : (Unit or Unit) -> * = \\b. match b return (\\_. *) { inl _ => Void | inr _ => Unit }; \
-            def nat_rec : (P:*) -> P -> (P -> P) -> W (Unit or Unit) Bf -> P = \\P z st w. w_rect (Unit or Unit) Bf (\\_. P) (\\a f ih. match a return (\\_. P) { inl _ => z | inr u => st (ih ()) }) w;");
-        fails("def Bf : (Unit or Unit) -> * = \\b. match b return (\\_. *) { inl _ => Void | inr _ => Unit }; \
+        ok("def Bf : (Unit or Unit) -> * = \\b. either_rect Unit Unit (\\_. *) (\\_. Void) (\\_. Unit) b; \
+            def nat_rec : (P:*) -> P -> (P -> P) -> W (Unit or Unit) Bf -> P = \\P z st w. w_rect (Unit or Unit) Bf (\\_. P) \
+                  (\\a f ih. either_rect Unit Unit (\\a2. ((b:Bf a2) -> P) -> P) \
+                              (\\u ih2. z) \
+                              (\\u ih2. st (ih2 ())) \
+                              a ih) w;");
+        fails("def Bf : (Unit or Unit) -> * = \\b. either_rect Unit Unit (\\_. *) (\\_. Void) (\\_. Unit) b; \
             def WNat : * = W (Unit or Unit) Bf; \
             def wzero : WNat = sup (Unit or Unit) Bf (inl () : Unit or Unit) (\\x. absurd WNat x); \
             def inlCase : (P:(WNat -> *)) -> (z:P wzero) -> (f:(Void -> WNat)) -> P (sup (Unit or Unit) Bf (inl () : Unit or Unit) f) = \\P z f. z;");
@@ -4323,7 +4155,6 @@ mod tests {
         // applications/projections cannot discard ill-typed arguments.
         fails("def k : (A:*) -> A -> * = \\A x. A; def bad (v:Void) : k Unit (() : Void) = absurd Unit v;");
         fails("def bad (v:Void) : fst (Void, (() : Void)) = absurd Void v;");
-        fails("def bad (v:Void) : match (inl () : Unit or Unit) return (\\_. *) { inl _ => Unit | inr _ => (() : Void) } = absurd Unit v;");
         ok("def good : ((let X : Unit = () in Unit) -> Unit) = \\x. x;");
         ok("def good : (Unit or (let X : Unit = () in Unit)) = inl ();");
     }
@@ -4434,7 +4265,7 @@ mod tests {
         ok("def ueta : (u:Unit) -> (P:(Unit -> *)) -> P u -> P () = \\u P x. x;");
         // The `inr`-case of WNat induction goes through on Unit-eta alone
         // (`f` vs `\\_. f ()` and `u` vs `()` both convert now).
-        ok("def Bf : (Unit or Unit) -> * = \\b. match b return (\\_. *) { inl _ => Void | inr _ => Unit }; \
+        ok("def Bf : (Unit or Unit) -> * = \\b. either_rect Unit Unit (\\_. *) (\\_. Void) (\\_. Unit) b; \
             def WNat : * = W (Unit or Unit) Bf; \
             def wzero : WNat = sup (Unit or Unit) Bf (inl () : Unit or Unit) (\\x. absurd WNat x); \
             def wsucc : WNat -> WNat = \\n. sup (Unit or Unit) Bf (inr () : Unit or Unit) (\\_. n); \
@@ -4592,59 +4423,6 @@ mod tests {
         fails("def bad : (v:Void) -> Void = \\v. either_rect Void Void (\\_. *) (\\a. absurd Void a) (\\b. b) (inl (absurd Void v));");
         // Bare `inl`/`inr` don't infer (which side? annotate).
         fails("def b : (v:Void) -> * = \\v. (let X = inl (absurd Void v) in X);");
-    }
-
-    #[test]
-    fn match_basic_case() {
-        // Non-dependent case analysis with a variable scrutinee.
-        ok("def c : (A:*) -> (B:*) -> (C:*) -> (f:A -> C) -> (g:B -> C) -> (e:A or B) -> C = \\A B C f g e. match e return (\\_. C) { inl a => f a | inr b => g b };");
-        // Closed scrutinees compute (iota through the checker, not just eval;
-        // injections need ascriptions — bare `inl` never infers).
-        ok("def t1 : Unit = match (inl () : Unit or Unit) return (\\_. Unit) { inl a => a | inr b => b };");
-        ok("def t2 : Unit = match (inr () : Unit or Unit) return (\\_. Unit) { inl a => a | inr b => b };");
-        // Non-variable (neutral, non-sum-stuck) scrutinees elaborate plainly.
-        ok("def t : (f:Unit -> Unit or Unit) -> Unit = \\f. match (f ()) return (\\_. Unit) { inl a => () | inr b => () };");
-        // Pattern binders carry payloads (swap uses both sides).
-        ok("def s : (E:*) -> (e:E or E) -> E or E = \\E e. match e return (\\_. E or E) { inl a => inr a | inr b => inl b };");
-    }
-
-    #[test]
-    fn match_refines_variable_scrutinee() {
-        // THE refinement test: `h : B e` is usable where `B (inl a)` and
-        // `B (inr b)` are expected — the branch contexts substituted the
-        // patterns for `e`. Fails with plain elaboration (`B e` vs
-        // `B (inl a)` never converts for abstract `B`), passes with it.
-        ok("def t : (E:*) -> (B:((E or E) -> *)) -> (e:E or E) -> (h:B e) -> B e = \\E B e h. match e return (\\x. B x) { inl a => h | inr b => h };");
-    }
-
-    #[test]
-    fn match_iota_pinned() {
-        // With neutral `P`, only iota closes this gap: the goal mentions the
-        // reduced `f ()` while the body infers the stuck chain. Fails without
-        // the eval-level `Match` iota branch, passes with it. (Also exercises
-        // the neutral-motive goal arm: `P` is a variable here.)
-        ok("def t : (P:((Unit or Unit) -> *)) -> (f:(a:Unit) -> P (inl a)) -> (g:(b:Unit) -> P (inr b)) -> (H:P (inl ()) -> *) -> H (f ()) -> H (match (inl () : Unit or Unit) return P { inl a => f a | inr b => g b }) = \\P f g H h. h;");
-    }
-
-    #[test]
-    fn match_neutral_headed_annotation() {
-        // A stuck match as an annotation fails cleanly — exactly like a
-        // stuck eliminator head (`elim_ann` probe): neutral-headed types
-        // must infer to a literal sort, and `infer_match` yields `P e`.
-        // (Reaches the `Value::Match` arm of `infer_sort_value`: quoted,
-        // inferred, then rejected with the match and its type shown.)
-        fails("def bad : (P:((Void or Void) -> *)) -> (e:Void or Void) -> match e return P { inl a => absurd (P (inl a)) a | inr b => absurd (P (inr b)) b } = \\P e. absurd (P e) e;");
-    }
-
-    #[test]
-    fn match_rejects_nonsense() {
-        // Scrutinee must be a sum (sorts are not sums).
-        fails("def bad : * = match * return (\\_. *) { inl a => * | inr b => * };");
-        // Motive must be a family over the sum (a bare type is not one).
-        fails("def bad : (e:Void or Void) -> Void = \\e. match e return Void { inl a => absurd Void a | inr b => b };");
-        // Branch bodies must fit the motive at the patterns (`a : Void`
-        // is not a `Unit`).
-        fails("def bad : (e:Void or Void) -> Unit = \\e. match e return (\\_. Unit) { inl a => a | inr b => () };");
     }
 
     #[test]
