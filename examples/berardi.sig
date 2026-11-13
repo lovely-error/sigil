@@ -28,17 +28,16 @@ def path_symm : (T:*) -> (a:T) -> (b:T) -> (p:path T a b) -> path T b a =
 def path_trans : (T:*) -> (a:T) -> (b:T) -> (c:T) -> path T a b -> path T b c -> path T a c =
   \T a b c p q. q (\t. path T a t) p;
 
--- Excluded middle over `*` (a hypothesis, never an axiom of the system)
+-- Excluded middle over `*` (a hypothesis, not an axiom of the system)
 def EM : * = (P:*) -> P or (P -> Void);
 
--- Two distinct booleans in `*`
 def Bool : * = Unit or Unit;
 def tt : Bool = inl ();
 def ff : Bool = inr ();
 
 -- tt and ff are distinct (large elimination of `or` into a `*`-valued family)
 def tt_ne_ff : path Bool tt ff -> Void =
-  \p. p (\b. match b return (\_. *) { inl _ => Unit | inr _ => Void }) ();
+  \p. p (\b. either_rect Unit Unit (\_. *) (\_. Unit) (\_. Void) b) ();
 
 -- IFProp and AC_IF
 def ifp : (em:EM) -> (B:*) -> (C:*) -> C -> C -> C =
