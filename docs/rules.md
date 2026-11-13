@@ -262,33 +262,6 @@ def unitVal : Unit = ();
 def leftIsUnit : Unit = either_rect Unit Unit (\_. Unit) (\_. ()) (\_. ()) (inl ());
 ```
 
-## PMCT eta: `(P:T -> *) -> P v -> P v`
-
-- **Formation**: ordinary Pi formation (the family is small, `P : T -> *`).
-- **Eta** (type-directed, `conv` / `pmct_eta_normalize`
-  `src/core.rs`): any `p` whose type unfolds to
-  `(P:T -> *) -> P v -> P v` converts with `\P x. x`; consequently
-  `p P x ≡ x` for every `P` and `x : P v`.
-- This is the parametricity/free-theorem principle behind the Lean axiom
-  `axiom pmct_eta_1 {v:T} (p : (P:T -> Sort _) -> P v -> P v) :
-  p = fun _ x => x`. It is stronger than ordinary function eta and is an
-  adopted trusted rule, not a derivable computation rule. It is
-  deliberately restricted to `P : T -> *`; the large-family version
-  (`P : T -> Type`) is not identified.
-- Unlike the shape-only Sigma/Unit arms, this rule needs the type of the
-  neutral, so the single conversion entry point (`conv`) is always
-  threaded with variable types and global recorded types; there is no
-  untyped conversion API.
-- **Pin**: `pmct_eta_holds` (`src/check.rs`) checks both
-  `p ≡ \P x. x` and `p P x ≡ x`, and rejects the same claims for
-  `f : A -> A` and for `P : T -> Type`.
-
-```sigil
-def pmct_beta : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) ->
-  (P:(T -> *)) -> (x:P v) -> path (P v) (p P x) x =
-  \T v p P x. id_path (P v) x;
-```
-
 ## W: `W A B` (well-founded trees)
 
 - **Formation** (`w_type` `src/check.rs:1446` — the only hand-built type
@@ -395,6 +368,29 @@ path_subst T v v (id_path T v) M h  ≡  h
 - ✗ a large-family lift (`P : T -> Type`) is rejected — conversion is
   equality, not lifting (`examples/fail_leib_lift.sig`).
 
+- **Eta** (type-directed, `conv` / `pmct_eta_normalize`
+  `src/core.rs`): any `p` whose type unfolds to
+  `(P:T -> *) -> P v -> P v` converts with `\P x. x`; consequently
+  `p P x ≡ x` for every `P` and `x : P v`.
+- This is the parametricity/free-theorem principle behind the Lean axiom
+  `axiom pmct_eta_1 {v:T} (p : (P:T -> Sort _) -> P v -> P v) :
+  p = fun _ x => x`. It is stronger than ordinary function eta and is an
+  adopted trusted rule, not a derivable computation rule. It is
+  deliberately restricted to `P : T -> *`; the large-family version
+  (`P : T -> Type`) is not identified.
+- Unlike the shape-only Sigma/Unit arms, this rule needs the type of the
+  neutral, so the single conversion entry point (`conv`) is always
+  threaded with variable types and global recorded types; there is no
+  untyped conversion API.
+- **Pin**: `pmct_eta_holds` (`src/check.rs`) checks both
+  `p ≡ \P x. x` and `p P x ≡ x`, and rejects the same claims for
+  `f : A -> A` and for `P : T -> Type`.
+
+```sigil
+def pmct_beta : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) ->
+  (P:(T -> *)) -> (x:P v) -> path (P v) (p P x) x =
+  \T v p P x. id_path (P v) x;
+```
 
 ## Derived data (no rules of their own)
 
