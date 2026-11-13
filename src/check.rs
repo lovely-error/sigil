@@ -612,18 +612,18 @@ impl Checker {
 
     pub fn report(&self) -> String {
         let mut s = String::new();
-        for (i, d) in self.decls.iter().enumerate() {
-            s.push_str(&format!(
-                "def {} ({}) : {}\n  = {}\n",
-                d.name,
-                if d.ok { "ok" } else { "FAIL" },
-                pretty_core(&d.ty, &self.gnames),
-                pretty_core(&d.val, &self.gnames),
-            ));
+        for (_, d) in self.decls.iter().enumerate() {
+            if !d.ok {
+                s.push_str(&format!(
+                    "def {} (FAIL) : {}\n  = {}\n",
+                    d.name,
+                    pretty_core(&d.ty, &self.gnames),
+                    pretty_core(&d.val, &self.gnames),
+                ));
+            }
             if let Some(e) = &d.error {
                 s.push_str(&format!("  error: {e}\n"));
             }
-            let _ = i;
         }
         if !self.has_errors() {
             s.push_str("=> all definitions checked OK\n");
