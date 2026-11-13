@@ -32,7 +32,7 @@ def fext : (A:*) -> (B:(A -> *)) -> (f:(x:A) -> B x) -> (g:(x:A) -> B x) -> ((x:
 
 -- Use: the `inl`-case transport of WNat induction (needs funext).
 def Bool : * = Unit or Unit;
-def Bf : Bool -> * = \b. match b return (\_. *) { inl _ => Void | inr _ => Unit };
+def Bf : Bool -> * = \b. either_rect Unit Unit (\_. *) (\_. Void) (\_. Unit) b;
 def WNat : * = W Bool Bf;
 def wzero : WNat = sup Bool Bf (inl () : Unit or Unit) (\x. absurd WNat x);
 def inlTransport : (P:(WNat -> *)) -> (z:P wzero) -> (f:(Void -> WNat)) -> P (sup Bool Bf (inl () : Unit or Unit) f)
