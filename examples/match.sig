@@ -21,6 +21,9 @@ def swap : (E:*) -> (e:E or E) -> E or E
 def transport : (E:*) -> (B:((E or E) -> *)) -> (e:E or E) -> (h:B e) -> B e
   = \E B e h. match e return (\x. B x) { inl a => h | inr b => h };
 
+def convoy_transport : (E:*) -> (B:((E or E) -> *)) -> (e:E or E) -> (h:B e) -> B e
+  = \E B e. either_rect E E (\x. B x -> B x) (\a h. h) (\b h. h) e;
+
 -- Full dependent case, eliminator-shaped (motive abstract).
 def depCase : (P:((Unit or Unit) -> *)) -> (f:(a:Unit) -> P (inl a)) -> (g:(b:Unit) -> P (inr b)) -> (H:P (inl ()) -> *) -> H (f ()) -> H (match (inl () : Unit or Unit) return P { inl a => f a | inr b => g b })
   = \P f g H h. h;
