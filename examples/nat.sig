@@ -11,31 +11,35 @@ def path_symm : (T:*) -> (a:T) -> (b:T) -> (p:path T a b) -> path T b a
   = \T a b p. p (\i. path T i a) (id_path T a);
 --
 -- A. W-DERIVED Nat (structural): W with boolean labels and a *split*
---    family (`B(inl)=Void`, `B(inr)=Unit`) written with `match`. Formation,
+--    family (`B(inl)=Void`, `B(inr)=Unit`) written with `either_rect`. Formation,
 --    introduction, AND non-dependent recursion check: the `w_rect` step
---    splits on the label with `match`, and branch refinement substitutes the
---    pattern into `ih`'s type — where the canonical pattern makes the stuck
---    family reduce by iota (`Bf (inr b) ≡ Unit`, so `ih ()` fits). Plain
---    `either_rect` cannot do this (no refinement: `ih` keeps type `Bf a`
---    over neutral `a`, and `ih ()` fails) — dependent `match` is exactly
---    the missing piece the old wall analysis predates.
+--    eliminates the label with `either_rect`, generalizing the motive over
+--    the induction hypothesis (`ih2 : (b:Bf a2) -> P` — convoy pattern) so
+--    the canonical pattern makes the family reduce by iota (`Bf (inr b) ≡ Unit`,
+--    allowing `ih2 ()` to fit in the `inr` branch).
 --    Dependent induction (`nat_ind`, section C below) goes through with
 --    transports in both branches — funext derived from quotients plus
---    Unit-eta — and one structural trick (the inner `match` motive
---    generalizes over every scrutinee-dependent premise, since `f : Bf a`
---    cannot fit `Bf a2` for abstract `a2`). No new axioms, no exactness:
---    the only axiom in play remains `quot_sound`.
+--    Unit-eta — and the same structural trick: the inner `either_rect` motive
+--    generalizes over every scrutinee-dependent premise (`f2`, `ih2` as
+--    motive binders — McBride-style), since `f : Bf a` cannot fit `Bf a2`
+--    for abstract `a2`. No new axioms, no exactness: the only axiom in play
+--    remains `quot_sound`.
 def Bool : * = Unit or Unit;
-def Bf : Bool -> * = \b. match b return (\_. *) { inl _ => Void | inr _ => Unit };
+def Bf : Bool -> * = \b. either_rect Unit Unit (\_. *) (\_. Void) (\_. Unit) b;
 def WNat : * = W Bool Bf;
 def wzero : WNat = sup Bool Bf (inl ()) (\x. absurd WNat x);
 def wsucc : WNat -> WNat = \n. sup Bool Bf (inr ()) (\_. n);
 def wone : WNat = wsucc wzero;
 def wtwo : WNat = wsucc wone;
--- Non-dependent recursion: the step matches on the label; refinement plus
--- iota makes `ih ()` fit in the `inr`-branch, `z` fits the `inl`-branch.
+-- Non-dependent recursion: the step cases on the label; convoy over ih
+-- makes `ih2 ()` fit in the `inr`-branch, `z` fits the `inl`-branch.
 def nat_rec : (P:*) -> P -> (P -> P) -> WNat -> P
-  = \P z st w. w_rect Bool Bf (\_. P) (\a f ih. match a return (\_. P) { inl _ => z | inr u => st (ih ()) }) w;
+  = \P z st w. w_rect Bool Bf (\_. P)
+      (\a f ih. either_rect Unit Unit (\a2. ((b:Bf a2) -> P) -> P)
+                  (\u ih2. z)
+                  (\u ih2. st (ih2 ()))
+                  a ih)
+      w;
 -- It computes: `copy (succ n) ≡ succ (copy n)` by iota chains alone.
 def copy : WNat -> WNat = nat_rec WNat wzero wsucc;
 def copyBeta : path WNat (copy wone) wone = id_path WNat wone;
@@ -46,7 +50,7 @@ def copyBeta2 : path WNat (copy wtwo) wtwo = id_path WNat wtwo;
 --    transporting reflexivity along the class-path gives the function-path,
 --    conversion closing by iota-under-eta — no exactness used) and Unit-eta
 --    (definitional uniqueness of `()`). Plus one structural trick: the inner
---    `match` motive generalizes over every scrutinee-dependent premise
+--    `either_rect` motive generalizes over every scrutinee-dependent premise
 --    (`f2`, `ih2` as motive binders — McBride-style), because `f : Bf a`
 --    cannot fit `Bf a2` for abstract `a2`; branches prove the generic case
 --    and the result applies to the outer terms.
@@ -69,7 +73,13 @@ def inrTransport : (P:(WNat -> *)) -> (st:(n:WNat) -> P n -> P (wsucc n)) -> (f:
 -- Dependent induction: `w_rect` step splits on the label under a generalized
 -- motive; each branch is a transport lemma above.
 def nat_ind : (P:(WNat -> *)) -> P wzero -> ((n:WNat) -> P n -> P (wsucc n)) -> (w:WNat) -> P w
-  = \P z st w. w_rect Bool Bf P (\a f ih. match a return (\a2. (f2 : Bf a2 -> WNat) -> ((b:Bf a2) -> P (f2 b)) -> P (sup Bool Bf a2 f2)) { inl u => \f2 ih2. inlTransport P z f2 u | inr u => \f2 ih2. inrTransport P st f2 ih2 u } f ih) w;
+  = \P z st w. w_rect Bool Bf P
+      (\a f ih. either_rect Unit Unit
+                  (\a2. (f2 : Bf a2 -> WNat) -> ((b:Bf a2) -> P (f2 b)) -> P (sup Bool Bf a2 f2))
+                  (\u f2 ih2. inlTransport P z f2 u)
+                  (\u f2 ih2. inrTransport P st f2 ih2 u)
+                  a f ih)
+      w;
 --
 -- B. CHURCH Nat (computational): impredicative iteration bakes recursion in
 --    (Pi into `*` from any domain admits it). Closed numerals compute definitionally by beta
@@ -113,7 +123,7 @@ def Dec : (A:*) -> * = \A. A or (A -> Void);
 
 -- Large elimination: a type-valued function on WNat, via w_rect with motive (\_. *)
 def isZero : WNat -> * =
-  \w. w_rect Bool Bf (\_. *) (\a f ih. match a return (\_. *) { inl _ => Unit | inr _ => Void }) w;
+  \w. w_rect Bool Bf (\_. *) (\a f ih. either_rect Unit Unit (\_. *) (\_. Unit) (\_. Void) a) w;
 
 -- 1. disjointness
 def zero_ne_succ : (n:WNat) -> path WNat wzero (wsucc n) -> Void =
@@ -121,7 +131,12 @@ def zero_ne_succ : (n:WNat) -> path WNat wzero (wsucc n) -> Void =
 
 -- 2. injectivity, via a predecessor
 def wpred : WNat -> WNat =
-  \w. w_rect Bool Bf (\_. WNat) (\a f ih. match a return (\_. WNat) { inl _ => wzero | inr u => f () }) w;
+  \w. w_rect Bool Bf (\_. WNat)
+    (\a f ih. either_rect Unit Unit (\a2. (f2 : Bf a2 -> WNat) -> WNat)
+                (\u f2. wzero)
+                (\u f2. f2 ())
+                a f)
+    w;
 def succ_inj : (n:WNat) -> (m:WNat) -> path WNat (wsucc n) (wsucc m) -> path WNat n m =
   \n m p. p (\x. path WNat n (wpred x)) (id_path WNat n);
 
