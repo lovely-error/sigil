@@ -4166,8 +4166,19 @@ mod tests {
         let src = "def a : Type0 = *; def a : Type0 = *; def c : Type0 = a;";
         let checker = check_program(src).expect("must parse");
         assert!(checker.has_errors(), "the duplicate must fail");
-        let report = checker.report();
-        assert!(report.contains("def c (ok)"), "later refs must resolve to the original:\n{report}");
+        assert_eq!(checker.decls.len(), 3, "every declaration is recorded");
+        assert!(checker.decls[0].ok, "first `a` must check");
+        assert!(!checker.decls[1].ok, "the duplicate must fail");
+        assert!(
+            checker.decls[1]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("duplicate definition 'a'"),
+            "the error must blame the duplicate: {:?}",
+            checker.decls[1].error
+        );
+        assert!(checker.decls[2].ok, "later refs must resolve to the original");
     }
 
     #[test]
