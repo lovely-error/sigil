@@ -46,7 +46,7 @@
 //!   dependent `w_rect` (iota builds an IH closure, so it fires in `eval`
 //!   where environments exist). Nat derived two ways (`examples/nat.sig`):
 //!   structurally via `W` with a split Bool family (formation/intro plus
-//!   non-dependent recursion via `match`-refined steps, plus dependent
+//!   non-dependent recursion via `either_rect`-split steps, plus dependent
 //!   induction via funext/Unit-eta transports under a generalized motive)
 //!   and computationally via Church
 //!   numerals (impredicative iteration; `plus one one ≡ two` proven).
@@ -101,7 +101,7 @@ mod lexer;
 mod parser;
 mod levels;
 mod core;
-mod subst;
+mod meta;
 mod check;
 mod cli;
 

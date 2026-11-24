@@ -5,7 +5,7 @@
 //!
 //! Sorts: `*` (impredicative bottom) and `Type` levels — bare `Type` is an
 //! ambiguous level (fresh variable per occurrence, generalized per def),
-//! `Type0`, `Type1`, ... are concrete levels. `#` is gone (lex error).
+//! `Type0`, `Type1`, ... are concrete levels.
 
 use std::fmt;
 
@@ -56,11 +56,6 @@ pub enum TokKind {
     W, // `W` (well-founded trees; fully reserved keyword)
     Sup, // `sup` (W introduction; fully reserved keyword)
     WRect, // `w_rect` (W eliminator; fully reserved keyword)
-    Match, // `match` (dependent case analysis; fully reserved keyword)
-    Return, // `return` (motive introducer in `match`; fully reserved keyword)
-    Pipe, // `|` (match-clause separator)
-    LBrace, // `{` (match-block open)
-    RBrace, // `}` (match-block close)
     And, // `and` (dependent pair type former; fully reserved keyword)
     Fst, // `fst` (first projection; fully reserved keyword)
     Snd, // `snd` (second projection; fully reserved keyword)
@@ -178,18 +173,6 @@ pub fn lex(src: &str) -> Result<Vec<Tok<'_>>, LexError> {
                     msg: "`#` was removed: write `Type` (ambiguous level) or `Type0`, `Type1`, ... (concrete levels)".to_string(),
                 });
             }
-            '|' => {
-                toks.push(Tok { kind: TokKind::Pipe, text: &src[i..i + 1], span: Span::new(start, start + 1) });
-                i += 1;
-            }
-            '{' => {
-                toks.push(Tok { kind: TokKind::LBrace, text: &src[i..i + 1], span: Span::new(start, start + 1) });
-                i += 1;
-            }
-            '}' => {
-                toks.push(Tok { kind: TokKind::RBrace, text: &src[i..i + 1], span: Span::new(start, start + 1) });
-                i += 1;
-            }
             '=' => {
                 if src[i..].starts_with("=>") {
                     toks.push(Tok { kind: TokKind::FatArrow, text: &src[i..i + 2], span: Span::new(start, start + 2) });
@@ -253,8 +236,6 @@ pub fn lex(src: &str) -> Result<Vec<Tok<'_>>, LexError> {
                         "W" => TokKind::W,
                         "sup" => TokKind::Sup,
                         "w_rect" => TokKind::WRect,
-                        "match" => TokKind::Match,
-                        "return" => TokKind::Return,
                         "and" => TokKind::And,
                         "fst" => TokKind::Fst,
                         "snd" => TokKind::Snd,
@@ -376,32 +357,6 @@ mod tests {
             ]
         );
     }
-    #[test]
-    fn lex_match_keywords() {
-        let toks = lex("match e return P { inl a => b | inr c => d }").unwrap();
-        let kinds: Vec<TokKind> = toks.iter().map(|t| t.kind.clone()).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                TokKind::Match,
-                TokKind::Ident,
-                TokKind::Return,
-                TokKind::Ident,
-                TokKind::LBrace,
-                TokKind::Inl,
-                TokKind::Ident,
-                TokKind::FatArrow,
-                TokKind::Ident,
-                TokKind::Pipe,
-                TokKind::Inr,
-                TokKind::Ident,
-                TokKind::FatArrow,
-                TokKind::Ident,
-                TokKind::RBrace,
-            ]
-        );
-    }
-
     #[test]
     fn lex_pair_keywords() {
         let toks = lex("and fst snd sig_rect (a, b)").unwrap();

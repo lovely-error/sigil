@@ -91,19 +91,6 @@
 //! pins its motive) carries transport-stated coherence; see its builder.
 //! Truncation (`Squash`) is derived from the trivial relation, not primitive.
 //!
-//! ## `match` (dependent case — `either_rect` with refinement)
-//! `match e return P { inl a => b1 | inr b => b2 } : P e` (exactly one
-//! `inl`/`inr` clause, no nesting; `*`-motives). Iota on canonical
-//! scrutinees fires in `eval` (needs no environment beyond the redex
-//! itself, but lives there alongside W-iota). Variable scrutinees refine:
-//! branch contexts substitute the constructor pattern for the scrutinee
-//! level (first-order and total — `subst.rs`; non-variable scrutinees
-//! elaborate plainly). Goals apply the motive closure to the pattern value
-//! (never motive-core in the pushed environment — off-by-push). The pattern
-//! binder denotes the *payload*; the injection shape is what the scrutinee
-//! refined to. Neutral-headed annotations (match or eliminator) infer to
-//! `P e`, not a literal sort, so they are rejected like all such heads.
-//!
 //! ## `Unit` (`Unit : *`, `()` inferable, `unit_rect` dependent, Unit-eta)
 //! Single-constructor types need no paradox review: `Unit` adds no smuggling
 //! (no content to project) and `unit_rect P b u : P u` eliminates into
@@ -129,18 +116,19 @@
 //!
 //! ## Nat, derived two ways (`examples/nat.sig`), induction included
 //! - STRUCTURAL (`WNat := W Bool Bf` with split `Bf(inl)=Void`,
-//!   `Bf(inr)=Unit` written by `match`): formation, introduction,
+//!   `Bf(inr)=Unit` written with `either_rect`): formation, introduction,
 //!   non-dependent recursion (`nat_rec`, computing definitionally), AND
 //!   dependent induction (`nat_ind`) all check. The ingredients, each
-//!   load-bearing: (i) branch refinement substitutes patterns into `ih`'s
-//!   type, where canonical patterns let stuck families reduce by iota;
-//!   (ii) definitional Unit-eta discharges payload equalities; (iii) funext
-//!   derived from quotients (`examples/funext.sig` — classes by
-//!   `quot_sound`, reflexivity transported along the class-path, conversion
-//!   closing by iota-under-eta, no exactness) discharges child-function
-//!   equalities; (iv) the inner `match` motive generalizes over every
-//!   scrutinee-dependent premise (`f2`, `ih2` as motive binders), since
-//!   `f : Bf a` cannot fit `Bf a2` for abstract `a2`.
+//!   load-bearing: (i) `either_rect` motives generalize over every
+//!   scrutinee-dependent premise (`f2`, `ih2` as motive binders — the
+//!   convoy pattern), so canonical labels let stuck families reduce by
+//!   iota; (ii) definitional Unit-eta discharges payload equalities;
+//!   (iii) funext derived from quotients (`examples/funext.sig` — classes
+//!   by `quot_sound`, reflexivity transported along the class-path,
+//!   conversion closing by iota-under-eta, no exactness) discharges
+//!   child-function equalities; (iv) the inner `either_rect` motive
+//!   generalizes over the induction hypothesis, since `f : Bf a` cannot
+//!   fit `Bf a2` for abstract `a2`.
 //! - COMPUTATIONAL (Church `Nat := (T:*) -> T -> (T -> T) -> T`, admitted by
 //!   impredicativity into `*`): closed numerals compute definitionally by
 //!   beta alone (`plus one one ≡ two`, proven); dependent induction still
@@ -166,7 +154,7 @@
 //! `infer` call, no retained constraints).
 use crate::core::{pretty_core, pretty_value, conv, eval, whnf, subst_level_value, level_vars_value, level_vars_constraint, Closure, Core, Env, EvalError, GlobalDef, GlobalVals, Sort, Value, FUEL_LIMIT, DEPTH_LIMIT};
 use crate::levels::{subst_level_constraint, Constraint, Level, Rel, check_satisfiable, fresh_level_var};
-use crate::subst::{contains_meta, occurs_meta, free_levels_value};
+use crate::meta::{contains_meta, occurs_meta, free_levels_value};
 use crate::lexer::{Span, line_col};
 use crate::parser::{SDecl, SExpr};
 use std::cell::{Cell, RefCell};
@@ -1320,9 +1308,8 @@ impl Checker {
             | Value::Meta { .. } => {
                 // Neutral type: quote back to core and infer; its type must
                 // be a sort (lets in types work: `eval` unfolded them above).
-                // (A stuck `Match` in type position lands here too: quoted
-                // back and inferred through `infer_match`. A `Meta` quotes to
-                // its hole, whose elaboration resolves the same id.)
+                // (A `Meta` quotes to its hole, whose elaboration resolves
+                // the same id.)
                 let mut fuel2 = FUEL_LIMIT;
                 let c = crate::core::quote(ctx.len(), &w, &self.gvals, &mut fuel2, 0)?;
                 let tty = self.infer(&c, ctx)?;
@@ -3806,7 +3793,7 @@ mod tests {
 
     #[test]
     fn wnat_recursion_derives_bare_transport_stalls() {
-        // Non-dependent `nat_rec` goes through (split family + refined step),
+        // Non-dependent `nat_rec` goes through (split family + convoy step),
         // and full `nat_ind` with explicit transports checks in `nat.sig`;
         // but a BARE `z` cannot cross the `inl`-branch (the child functions
         // differ — transport, now derived, is genuinely required). So this

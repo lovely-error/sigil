@@ -491,7 +491,7 @@ impl<'a> Parser<'a> {
                 | Some(TokKind::W) | Some(TokKind::Sup) | Some(TokKind::WRect)
                 | Some(TokKind::Fst) | Some(TokKind::Snd)
                 | Some(TokKind::SigRect) | Some(TokKind::Inl) | Some(TokKind::Inr)
-                | Some(TokKind::EitherRect) | Some(TokKind::Match)
+                | Some(TokKind::EitherRect)
                 | Some(TokKind::Quot) | Some(TokKind::QuotMk)
                 | Some(TokKind::QuotLift) | Some(TokKind::QuotInd) | Some(TokKind::QuotSound) => true,
                 _ => false,

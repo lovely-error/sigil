@@ -20,7 +20,7 @@ use std::fmt;
 use crate::levels::{Constraint, Level, Rel};
 
 use crate::lexer::Span;
-use crate::subst::{contains_meta, free_levels_value};
+use crate::meta::{contains_meta, free_levels_value};
 
 /// Evaluation fuel: bounds beta/delta steps so diverging terms (e.g.
 /// `(\x. x x) (\x. x x)`) become errors instead of hangs. Calibrated at

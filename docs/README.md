@@ -24,5 +24,5 @@ Source of truth is the code:
 - `src/lexer.rs`, `src/parser.rs` — tokens and surface syntax.
 - `src/core.rs` — sorts, eval/`whnf`/`quote`/`conv`.
 - `src/levels.rs` — level constraints and cycle check.
-- `src/subst.rs` — `match` refinement substitution.
+- `src/meta.rs` — metavariable and free-level traversals for hole elaboration.
 - `src/check.rs`, `src/main.rs` — scope + bidirectional checking, theory notes.

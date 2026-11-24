@@ -1,45 +1,20 @@
-//! First-order substitution for dependent `match` refinement.
+//! Metavariable and free-level traversals over `Value`/`Closure`/`Core`.
 //!
-//! When `match x return P { inl a => … | inr b => … }` splits on a *variable*
-//! scrutinee at level `lx`, branch bodies are checked with `x` replaced by
-//! the constructor pattern — including inside the types (and values) of the
-//! surrounding context entries. That replacement is what this module does.
+//! Hole elaboration in `check.rs` needs three structural queries:
+//! - `contains_meta` — does a value mention any metavariable? Routes
+//!   conversion around `conv`, which decides only closed problems.
+//! - `occurs_meta` — does a value mention a specific metavariable? The
+//!   occurs check that keeps hole assignment from building infinite terms.
+//! - `free_levels_value` — which absolute context levels does a value
+//!   mention? Bounds hole solutions to the context that created them.
 //!
-//! Design notes (all load-bearing, all tested below):
-//! - Only ever variable-against-constructor-of-variable: the pattern is
-//!   `Inl(Var(lf))` / `Inr(Var(lf))` for a fresh pattern level `lf`. No
-//!   unification, no higher-order matching — total by construction.
-//! - De Bruijn *levels* in values are absolute, so value substitution never
-//!   shifts anything. Core terms use *indices* (relative), so core
-//!   substitution resolves each index through the closure environment
-//!   (stack order, exactly like evaluation): only an index that resolves to
-//!   an entry that is *exactly* `Var(lx)` is replaced. Level arithmetic from
-//!   the environment length alone is unsound here — closure environments are
-//!   evaluation chains (often longer than the checking context and holding
-//!   closed entries), so length-derived levels collide with live context
-//!   levels and replace the wrong variable.
-//! - Every closure term is scoped for its environment *plus one pending
-//!   value-binder* (its own Pi/Sigma/Lam/branch binder, pushed on apply).
-//!   Index `0` (past the core binders) denotes that pending binder, whose
-//!   level is fresh — never `lx` — so it is always left unchanged.
-//! - On any doubt (core-bound indices, the pending slot, non-variable
-//!   entries, out-of-range indices, underflow), nodes are left unchanged.
-//!   Skipping is fail-safe: it only ever *removes* refinement (more
-//!   stuckness, i.e. possible incompleteness), never admits ill-typed terms
-//!   (nothing new becomes convertible).
-//! - Binary sums bind exactly one pattern variable, so substitution never
-//!   changes arity/lengths anywhere. (Multi-binder patterns would need
-//!   shifting — deferred with general patterns.)
+//! Closure terms are resolved through their environments in stack order,
+//! exactly like evaluation: a core de Bruijn index that reaches past the
+//! term's own binders selects an environment entry (0 = innermost), and
+//! core binders / the pending value-binder carry no absolute level. All
+//! traversals are total and structural; depth is bounded by the value.
 
 use crate::core::{Closure, Core, Value};
-
-// ---------------------------------------------------------------------------
-// Metavariable traversals (for hole elaboration — see `check.rs`)
-// ---------------------------------------------------------------------------
-// All three resolve closure terms through their environments with the same
-// discipline as `subst_core` (stack order like evaluation; core binders and
-// the pending value-binder carry no absolute level). They are total and
-// structural; depth is bounded by the value itself.
 
 /// Whether a value mentions any metavariable (used to route conversion
 /// around `conv`, which only decides closed problems).
@@ -310,7 +285,7 @@ fn free_levels_core(t: &Core, env: &[Value], c: usize, out: &mut Vec<usize>) {
             free_levels_core(b, env, c, out);
         }
         // `Inl`/`Inr`/`Fst`/`Snd`/`QuotMk` wrap terms without binding
-        // anything (only `Lam` — and match/let bodies above — extend `c`).
+        // anything (only `Lam` and `let` bodies extend `c`).
         Core::Inl(a) | Core::Inr(a) | Core::Fst(a) | Core::Snd(a) | Core::QuotMk(a) => {
             free_levels_core(a, env, c, out)
         }

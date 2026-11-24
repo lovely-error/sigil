@@ -20,7 +20,7 @@ still requires.
    `do_apply`, `quote`, `conv` — `src/core.rs`). Exhaustion is an
    `EvalError`/`CheckError`, never a wrong answer or a hang.
 2. **Type safety** — subject reduction (typing survives beta, delta, every
-   iota, eta, and `match` refinement) and canonical forms. This is where
+   iota, and eta) and canonical forms. This is where
    most of the inventory below lives.
 3. **Consistency** — no closed term of `Void`. Via `absurd` this yields:
    nothing is provably always-false; in particular `Type0 : Type0` is
@@ -106,7 +106,7 @@ and the pin.
   for `P : T -> Type`.
 - **Known limitation**: the value-level type oracle only reconstructs
   types for neutral forms it knows (`Var`, `Global`, `App`, `Fst`,
-  `Snd`, `Match`); binder types introduced inside conversion's own
+  `Snd`); binder types introduced inside conversion's own
   lambda-eta expansion are unknown. That can make the rule miss an
   exotic nested occurrence, but never fires it on the wrong type:
   missing a reduction only loses completeness.
@@ -128,26 +128,15 @@ and the pin.
 - **Pair eta** (`src/core.rs:1140-1165`): components convert with
   projections; sound under the same conv contract as above.
 
-### Sums (`or`) and `match`
+### Sums (`or`)
 
 - **Introduction** (`check_inject` `src/check.rs:2914`): the goal must
   whnf to a canonical sum, and the payload checks against the matching
   side; bare injections are rejected ✗ (`examples/fail_either.sig`).
-- **`either_rect`/`match` iota** (`src/core.rs`): both sides reduce on
+- **`either_rect` iota** (`src/core.rs`): both sides reduce on
   canonical scrutinees; reducts are pre-checked against `P (inl a)` /
-  `P (inr b)` at the minor premises.
-- **`match` refinement** (`src/subst.rs:1-33`, all load-bearing notes
-  tested): substitution of the constructor pattern for the scrutinee level
-  is (i) first-order and total (variable-against-constructor-only,
-  one-pattern-variable — binary sums, so no shifting), (ii) exact — a core
-  index is replaced only when it resolves to *exactly* `Var(lx)` through
-  the closure environment (level arithmetic from environment length is
-  unsound and is not used), and (iii) fail-safe — on any doubt nodes are
-  left unchanged, which only subtracts refinement: it can cause
-  incompleteness (stuckness), never admit ill-typed terms, because
-  nothing new becomes convertible. Pins: `src/subst.rs` unit tests
-  (`underflow_is_identity`, `var_hit_and_miss`, …) and
-  `examples/match.sig` (the refinement flagship `transport`).
+  `P (inr b)` at the minor premises. Dependent elimination uses an
+  explicit motive (`examples/nat.sig`).
 
 ### `Void` and `Unit`
 
@@ -177,7 +166,7 @@ and the pin.
   one level above the environment (quoting at `level + 1` lifts past the
   new binder for free — no explicit lift pass to get wrong).
 - **Pin**: `examples/nat.sig` runs full `nat_ind` end-to-end (formation,
-  iota, refinement, eta interplay all exercised).
+  iota, transport, eta interplay all exercised).
 
 ### Quotients and truncation
 
@@ -232,11 +221,11 @@ Every known attack path is pinned; run them as part of `cargo test`
 | `fail_forward.sig`, `fail_self.sig`, `fail_bogus_rec.sig` | Non-terminating or self-referential unfolding |
 | `fail_hole*.sig` | Unchecked/meta solutions escaping |
 | `fail_void.sig`, `fail_unit.sig` | Sort confusion (`() : Void`, `Unit : Unit`) |
-| `fail_either.sig`, `fail_match.sig` | Bare injections, non-sum scrutinees, bad motives |
+| `fail_either.sig` | Bare injections, non-sum scrutinees, bad motives |
 
 Plus the positive corpus (each `examples/*.sig`) doubles as an
 end-to-end exercise: `nat.sig`/`funext.sig` exercise the entire
-W-iota + refinement + eta machinery.
+W-iota + transport + eta machinery.
 
 ## Not claimed (yet)
 
@@ -269,10 +258,9 @@ Honest boundaries of the current assurance:
    `fail_*` pins.
 3. **Pen-and-paper metatheory** (weeks): the standard lemma list —
    context well-formedness, validity, subject reduction per reduction
-   kind (beta, delta, each iota, eta, refinement substitution, W
-   closure), then normalization. The genuinely nonstandard deltas are
-   W-iota's environment quoting (`src/core.rs:662-665`) and `match`
-   refinement (`src/subst.rs`).
+   kind (beta, delta, each iota, eta, W closure), then normalization.
+   The genuinely nonstandard delta is W-iota's environment quoting
+   (`src/core.rs:662-665`).
 4. **Mechanization** (months, definitive): embed the core in Lean or
    Isabelle — syntax, typing, small-step reduction, Progress, Subject
    Reduction; then consistency by model. Given the ECC shape, the

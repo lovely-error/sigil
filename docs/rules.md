@@ -38,7 +38,7 @@ mark the check-only introductions.
 
 Motives: `sig_rect`/`either_rect`/`unit_rect`/`w_rect` take motives at any
 level (predicative formation keeps large elimination honest);
-`match` and `quot_ind` are pinned to `*`-motives (`docs/theory.md`).
+`quot_ind` is pinned to `*`-motives (`docs/theory.md`).
 
 ## Sorts
 
@@ -188,12 +188,9 @@ def mk : (v:Void) -> ((x:Void) and Void) = \v. (absurd Void v, absurd Void v);
 - **Elimination**:
   - `either_rect A B P f g e : P e` (`either_rect_type`
     `src/check.rs:3126`) with `f : (a:A) -> P (inl a)`,
-    `g : (b:B) -> P (inr b)`; motives at any level.
-  - dependent `match e return P { inl a => b1 | inr b => b2 } : P e` — one
-    clause per side, no nesting, `*`-motives only (`docs/theory.md` why);
-    a *variable* scrutinee refines branch contexts by first-order total
-    substitution of the pattern for the scrutinee level (`src/subst.rs`),
-    fail-safe toward stuckness, never toward ill-typing.
+    `g : (b:B) -> P (inr b)`; motives at any level. Dependent elimination
+    uses an explicit motive and the convoy pattern where needed
+    (`examples/nat.sig`).
 - **Computation** (iota, both sides):
 
 ```text
@@ -201,9 +198,7 @@ either_rect A B P f g (inl a)  ≡  f a
 either_rect A B P f g (inr b)  ≡  g b
 ```
 
-  `match` iota fires on canonical scrutinees and stays stuck on neutrals;
-  refinement makes `h : B e` usable at `B (inl a)` with no transport
-  (`examples/match.sig` `transport`).
+  Iota fires on canonical scrutinees and stays stuck on neutrals.
 
 ```sigil
 def vsum : * = Void or Void;
@@ -304,7 +299,7 @@ w_rect A B P s (sup A B a f)  ≡  s a f (\b. w_rect A B P s (f b))
 
 ```sigil
 def Bool : * = Unit or Unit;
-def Bf : Bool -> * = \b. match b return (\_. *) { inl _ => Void | inr _ => Unit };
+def Bf : Bool -> * = \b. either_rect Unit Unit (\_. *) (\_. Void) (\_. Unit) b;
 def WNat : * = W Bool Bf;
 def wzero : WNat = sup Bool Bf (inl ()) (\x. absurd WNat x);
 ```
@@ -396,7 +391,7 @@ def pmct_beta : (T:*) -> (v:T) -> (p:(P:(T -> *)) -> P v -> P v) ->
 
 `Nat` is not primitive: it is derived on top of the rules above, two ways
 (`examples/nat.sig`) — structurally as `WNat := W Bool Bf` with the
-`match`-refined `w_rect` step (formation, introduction, recursion and full
-dependent induction all check), and as a Church encoding admitted by the
-impredicative-into-`*` Pi rule (numerals compute by beta alone; dependent
-induction underivable there).
+`either_rect`-split `w_rect` step (convoy pattern; formation, introduction,
+recursion and full dependent induction all check), and as a Church encoding
+admitted by the impredicative-into-`*` Pi rule (numerals compute by beta
+alone; dependent induction underivable there).

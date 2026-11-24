@@ -96,7 +96,7 @@ Notes:
   as `_`, internally `$wild<n>`).
 - Reserved keywords cannot be redefined as globals: `Void absurd Unit
   unit_rect W sup w_rect and or inl inr either_rect fst snd sig_rect Quot
-  quot_mk quot_lift quot_ind quot_sound match Type *` and friends
+  quot_mk quot_lift quot_ind quot_sound Type *` and friends
   (`src/parser.rs` tests pin this).
 
 ## Expressions
@@ -115,7 +115,6 @@ Notes:
 | Sigma elim | `sig_rect A B P f p` | all args explicit, iota `f a b` |
 | Sums | `A or B`, `inl a`, `inr b` | `inl`/`inr` check-only: annotate, e.g. `(inl () : Unit or Unit)` |
 | Sum elim | `either_rect A B P f g e` | motives at any level, iota both sides |
-| Case | `match e return P { inl a => b1 \| inr b => b2 }` | exactly one `inl` + one `inr`, either order, no nesting |
 | Quotients | `Quot A R`, `quot_mk a` | `quot_mk` check-only like injections |
 | Quot elim | `quot_lift A R B f h q`, `quot_ind A R P f coh q` | `h`/`coh` explicit; iota on `quot_mk` |
 | Quot axiom | `quot_sound A R a b h` | stuck-neutral, the primitive axiom |
@@ -172,10 +171,9 @@ Bare introductions never infer: `inl`, `inr`, `quot_mk` need a known type
 from annotation or the expected type. `(inl () : Unit or Unit)` works,
 bare `inl ()` as a def body does not.
 
-`match` scrutinee: a *variable* refines branch contexts (`subst.rs`
-substitution); anything else elaborates plainly like `either_rect`.
-Neutral-headed annotations (`match`/`either_rect` stuck on a variable)
-infer to `P e`, not a literal sort, and are rejected in type position.
+Case analysis is `either_rect` only.
+Neutral-headed annotations (`either_rect` stuck on a variable) infer to
+`P e`, not a literal sort, and are rejected in type position.
 
 `Nat : Nat`-style confusion is rejected: neutrals denoting types check in
 formation position instead of converting, but non-sort expectations still

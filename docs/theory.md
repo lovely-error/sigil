@@ -136,21 +136,14 @@ at any level — Coq's `sigT`-in-`Type` configuration). Pair-eta holds
 definitionally (`p ≡ (fst p, snd p)` in conversion, like function and Unit
 eta). See `examples/sigma.sig`.
 
-## Predicative sums and `match`
+## Predicative sums
 
 `A or B` forms predicatively (`max`); `inl`/`inr` check against a known sum;
 `either_rect A B P f g e : P e` eliminates with iota on both sides (motives
-at any level). Same cautious footing as Sigma.
-
-Dependent `match e return P { inl a => b1 | inr b => b2 } : P e`
-(`examples/match.sig`): exactly one `inl`/`inr` clause, no nesting,
-`*`-motives. Iota on canonical scrutinees fires in `eval`. A *variable*
-scrutinee refines branch contexts by first-order total substitution of the
-constructor pattern for the scrutinee level (`src/subst.rs`: values need no
-shifting since levels are absolute; core indices resolve through the closure
-environment in stack order past the pending binder; any doubt leaves the
-node unchanged — fail-safe toward stuckness, never toward ill-typing).
-Non-variable scrutinees elaborate plainly like the eliminator.
+at any level). Same cautious footing as Sigma. Dependent elimination goes
+through `either_rect` with an explicit motive, using the convoy pattern
+where the motive must generalize over scrutinee-dependent premises
+(`examples/nat.sig`).
 
 ## `Void` and `Unit`
 
@@ -191,9 +184,9 @@ environment so free variables keep their levels.
 
 Nat is derived two ways (`examples/nat.sig`): structurally via `W` over a
 split Bool family (formation, intro, `nat_rec` computing definitionally via
-`match`-refined `w_rect` steps, full `nat_ind` via derived funext +
-Unit-eta transports under a generalized motive), and computationally via
-Church numerals (`plus one one ≡ two` by beta alone; Geuvers: dependent
+`either_rect`-split `w_rect` steps (convoy pattern), full `nat_ind` via
+derived funext + Unit-eta transports under a generalized motive), and
+computationally via Church numerals (`plus one one ≡ two` by beta alone; Geuvers: dependent
 induction not derivable there). A third, richer derivation is the AFS
 subtyping refinement (`examples/afsnat.sig`,
 `Nat := Σ(ν:NatStar) Lim(ν)` with `Lim′` certificates): formation, intro
